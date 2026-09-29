@@ -1,0 +1,95 @@
+# The core loop in the GUI surfaces. Every title completes
+# "<title> is broken when ...".
+cases:
+  - id: settings-open
+    title: The settings gear opens provider settings
+    priority: smoke
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched]
+    touches: [apps/vscode/webview-ui, apps/examples/desktop-app/webview, sdk/packages/ui]
+    minutes: 2
+    steps: |
+      1. Click the settings gear in the Cline panel header (desktop: Settings in the sidebar).
+      2. Expect a settings view with an API Provider selector and a model selector.
+      3. Screenshot the settings view; close it.
+      4. Expect the chat view returns with its input focused or focusable.
+
+  - id: send-and-reply
+    title: Sending a message produces a streamed assistant reply
+    priority: smoke
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched, provider-cline]
+    touches: [sdk/packages/core/src/session, sdk/packages/llms]
+    minutes: 3
+    steps: |
+      1. Start a new task. Type "Say hello and then stop." and press Enter.
+      2. Expect the message appears as a user bubble immediately.
+      3. Expect an assistant reply begins streaming within 20 s and completes within 60 s.
+      4. Expect no error banner. Expect the input is re-enabled after completion.
+
+  - id: create-file-auto-approved
+    title: A file created by Cline appears on disk and in the file tree
+    priority: smoke
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [sdk/packages/core/src/extensions/tools, apps/vscode/src/integrations]
+    minutes: 4
+    steps: |
+      1. New task: "Create hello.txt in the workspace root containing exactly the line: hello from autoqa". Send.
+      2. Expect a write_to_file / create-file tool block appears in the chat and is auto-approved without a button press.
+      3. Expect Cline reports completion within 90 s.
+      4. In a shell run `cat ~/qa/scratch/hello.txt` (PowerShell: Get-Content). Expect the exact line.
+      5. Expect the IDE file tree / explorer shows hello.txt.
+
+  - id: run-command-auto-approved
+    title: A terminal command run by Cline shows its output in the chat
+    priority: smoke
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [sdk/packages/core/src/extensions/tools, apps/vscode/src/integrations/terminal]
+    minutes: 4
+    steps: |
+      1. New task: "Run the command `git log --oneline -n 1` and tell me the commit subject." Send.
+      2. Expect an execute_command block showing the command.
+      3. Expect the block shows output containing the word "init" (the scratch repo's only commit).
+      4. Expect the assistant's final message quotes "init".
+
+  - id: approve-edit-button
+    title: The Approve button on a file edit applies the edit
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready-gated]
+    touches: [apps/vscode/webview-ui/src/components/chat, apps/examples/desktop-app/webview]
+    minutes: 4
+    steps: |
+      1. New task: "Append the line `approved` to README.md". Send.
+      2. Expect the edit block stops with Approve and Reject buttons visible and the file NOT yet changed on disk (`cat README.md` shows only `hello`).
+      3. Click Approve.
+      4. Expect README.md now ends with `approved` and Cline continues to completion.
+
+  - id: reject-edit-button
+    title: The Reject button on a file edit leaves the file untouched
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready-gated]
+    touches: [apps/vscode/webview-ui/src/components/chat, apps/examples/desktop-app/webview]
+    minutes: 4
+    steps: |
+      1. New task: "Append the line `rejected` to README.md". Send.
+      2. Expect Approve/Reject on the edit block.
+      3. Click Reject. If a feedback box appears, type "not now" and submit.
+      4. Expect README.md does not contain `rejected`.
+      5. Expect the assistant acknowledges the rejection rather than erroring.
+
+  - id: cancel-mid-stream
+    title: The Cancel button stops a streaming reply
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched, provider-cline]
+    touches: [sdk/packages/core/src/session, apps/vscode/webview-ui/src/components/chat]
+    minutes: 3
+    steps: |
+      1. New task: "Write a 2000 word essay about the history of the terminal." Send.
+      2. As soon as text is streaming, click Cancel (or the stop button).
+      3. Expect streaming stops within 3 s and the partial text remains visible.
+      4. Expect the input is enabled and a follow-up "Summarise what you wrote in one line." gets a reply.

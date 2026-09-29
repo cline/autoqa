@@ -1,0 +1,9 @@
+# Prerequisites that only make sense in the GUI surfaces (desktop, vscode,
+# jetbrains). Visible to cases under cases/ide/ only.
+prerequisites:
+  - id: checkpoints-enabled
+    summary: Checkpoints are on.
+    per_surface: true
+    requires: [launched]
+    check: Settings > Features > "Enable Checkpoints" is on.
+    establish: Turn the toggle on.

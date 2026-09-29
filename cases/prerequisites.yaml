@@ -1,0 +1,131 @@
+# Prerequisites are facts about the host. The agent establishes them, the
+# planner tracks them, cases consume them. Keep `check` and `establish` short
+# and imperative; they are read by an agent, not a human.
+#
+# This root file declares the surfaces and the prerequisites every case may
+# use. A `prerequisites.yaml` in a subdirectory adds prerequisites visible
+# only to cases in that directory and below (see cases/ide/prerequisites.yaml).
+#
+# Surface-specific facts (`per_surface: true`) are tracked as `id@surface`.
+# Targets (which build of each surface is under test) are declared at run
+# start, not here; see docs/targets.md.
+
+surfaces:
+  - id: desktop
+    name: Cline Desktop
+    platforms: [linux, windows, macos]
+    touches: [apps/examples/desktop-app, sdk/packages/core, sdk/packages/ui]
+  - id: vscode
+    name: VS Code extension
+    platforms: [linux, windows, macos]
+    touches: [apps/vscode, sdk/packages/core]
+  - id: jetbrains
+    name: JetBrains plugin
+    platforms: [linux, windows, macos]
+    touches: [apps/vscode/src/standalone, apps/vscode/src/hosts, sdk/packages/core]
+  - id: cli
+    name: Cline CLI (TUI and headless)
+    platforms: [linux, windows, macos]
+    touches: [apps/cli, apps/cline-hub, sdk/packages/core]
+
+prerequisites:
+  # --- host ---------------------------------------------------------------
+  - id: host-ready
+    summary: Screen is visible, the qbt backend answers, a shell works, and the proxy env is loaded.
+    check: |
+      Take a screenshot; you must see a desktop. In a shell, `echo $HTTPS_PROXY` (or `$Env:HTTPS_PROXY`) is non-empty.
+  - id: scratch-repo
+    summary: A small throwaway git repo exists at ~/qa/scratch with one commit.
+    requires: [host-ready]
+    check: run `git -C ~/qa/scratch log --oneline -n1` and expect one line.
+    establish: |
+      mkdir -p ~/qa/scratch && cd ~/qa/scratch && git init -q && printf 'hello\n' > README.md && git add . && git commit -qm init
+      (PowerShell: New-Item -ItemType Directory -Force ~/qa/scratch; cd ~/qa/scratch; git init -q; 'hello' | Set-Content README.md; git add .; git commit -qm init)
+  - id: cline-repo
+    summary: The cline/cline repo is cloned at ~/qa/cline on main.
+    requires: [host-ready]
+    check: run `git -C ~/qa/cline rev-parse --short HEAD` and expect a hash.
+    establish: git clone --depth 50 https://github.com/cline/cline ~/qa/cline
+
+  # --- app installed & launched -------------------------------------------
+  - id: installed
+    summary: The surface is installed and is the target build declared at run start (release, nightly, or dev at a ref).
+    per_surface: true
+    requires: [host-ready]
+    check: |
+      The installed version matches the run's target for this surface.
+      desktop: About dialog or `--version` shows the target version (dev: the build's commit).
+      vscode: `code --list-extensions --show-versions | grep -i saoudrizwan.claude-dev` shows the target version; for dev, the extension host was launched with --extensionDevelopmentPath at the target ref.
+      jetbrains: Settings > Plugins shows Cline at the target version.
+      cli: `cline version` prints the target version; for dev, `bun run cli version` from the worktree.
+    establish: |
+      release: install the published artifact — desktop from the GitHub release tagged desktop-latest; vscode `code --install-extension saoudrizwan.claude-dev`; jetbrains via Settings > Plugins > Marketplace; cli `npm i -g cline`.
+      nightly: same sources, nightly/beta channel (desktop-beta release, VS Code pre-release, JetBrains EAP channel, `npm i -g cline@nightly`).
+      dev: `git -C ~/qa/cline worktree add ~/qa/wt/<ref> <ref>`, `bun install && bun run build:sdk` there, then per surface: cli `bun run cli`; vscode `bun run build:webview && bun esbuild.mjs` in apps/vscode and launch `code --extensionDevelopmentPath=<worktree>/apps/vscode`; desktop `bun run dev` in apps/examples/desktop-app; jetbrains see the intellij-plugin repo README. Record the commit as the target version.
+  - id: launched
+    summary: The surface is running with its Cline UI visible and a workspace open.
+    per_surface: true
+    requires: [installed, scratch-repo]
+    check: |
+      Screenshot shows the surface's Cline chat input.
+      desktop: main window with the composer visible and ~/qa/scratch selected as the workspace.
+      vscode: window with ~/qa/scratch open and the Cline sidebar visible.
+      jetbrains: project ~/qa/scratch open, View > Tool Windows > Cline shown.
+      cli: a terminal running `cline -i` in ~/qa/scratch showing "What can I do for you?".
+    establish: |
+      Launch the app, open ~/qa/scratch, reveal the Cline panel. On Linux pass --no-sandbox to VS Code if it refuses to start in the container.
+
+  # --- provider / auth ------------------------------------------------------
+  - id: signed-in
+    summary: Signed in to a Cline account on this surface. Which account is a run-time matter; credentials come from the host, never from this repo.
+    per_surface: true
+    requires: [launched]
+    check: The settings/account view shows an account email and a credit balance rather than a Sign in button.
+    establish: |
+      Open provider settings, choose provider "Cline", click Sign in. The proxy completes OAuth for the host's configured account; if a browser tab opens, finish the flow there and return to the app.
+    teardown: Open the account view and click Sign out.
+  - id: provider-cline
+    summary: Provider is Cline (usage-billing) with a fast paid model selected and inference works.
+    per_surface: true
+    requires: [signed-in]
+    check: Send "Reply with exactly the word pong." and expect an assistant reply containing "pong" within 60 s.
+    establish: In provider settings choose Cline, model "anthropic/claude-sonnet-4.5" (or the default recommended model), save, then run the check.
+  - id: provider-anthropic
+    summary: Provider is Anthropic with the key from the host environment and inference works.
+    per_surface: true
+    requires: [launched]
+    check: Send "Reply with exactly the word pong." and expect "pong" within 60 s.
+    establish: |
+      In provider settings choose Anthropic, paste the value of $ANTHROPIC_API_KEY (the proxy substitutes the real key at egress), choose claude-sonnet-4-5, save, run the check.
+      cli: `cline -P anthropic -m claude-sonnet-4-5 "Reply with exactly the word pong."` reads the env var directly.
+
+  # --- approval mode --------------------------------------------------------
+  - id: auto-approve-all
+    summary: Every tool call is auto-approved.
+    per_surface: true
+    requires: [launched]
+    check: |
+      desktop/vscode/jetbrains: auto-approve settings show all categories on, or YOLO checked.
+      cli: the session was started without --auto-approve false.
+    establish: |
+      desktop/vscode/jetbrains: open Settings > Features/Auto Approve and enable every category or YOLO.
+      cli: nothing to do; `cline` defaults to --auto-approve true.
+    teardown: Disable YOLO and all auto-approve categories.
+  - id: approval-required
+    summary: File edits and commands require manual approval.
+    per_surface: true
+    requires: [launched]
+    check: |
+      desktop/vscode/jetbrains: auto-approve settings show edits and commands off; YOLO off.
+      cli: the TUI was launched with --auto-approve false.
+    establish: |
+      desktop/vscode/jetbrains: disable YOLO and the edit/command categories.
+      cli: launch with `cline -i --auto-approve false`.
+
+groups:
+  - id: ready
+    summary: Installed, launched, signed in to Cline provider with working inference, all tools auto-approved.
+    members: [launched, provider-cline, auto-approve-all]
+  - id: ready-gated
+    summary: Like ready but approvals are required, for testing the approval UI.
+    members: [launched, provider-cline, approval-required]

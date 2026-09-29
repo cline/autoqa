@@ -1,0 +1,109 @@
+# Desktop-only behaviour. Cross-surface behaviour lives in cases/ide/.
+cases:
+  - id: desktop-workspace-picker
+    title: The workspace picker opens a folder and shows its branch
+    priority: smoke
+    surfaces: [desktop]
+    requires: [launched]
+    touches: [apps/examples/desktop-app/webview/components/workspace]
+    minutes: 3
+    steps: |
+      1. Open the workspace selector and choose ~/qa/scratch (add it if not listed).
+      2. Expect the selector shows "scratch" and the branch shows master or main.
+      3. Screenshot.
+
+  - id: desktop-parallel-sessions
+    title: Two sessions stream at the same time without mixing output
+    priority: high
+    surfaces: [desktop]
+    requires: [ready]
+    touches: [apps/examples/desktop-app/sidecar, apps/cline-hub]
+    minutes: 5
+    steps: |
+      1. Start session A: "Count slowly from 1 to 30, one number per line." Immediately start a second session B (new session control): "List the letters A to Z one per line."
+      2. Expect both appear in the sidebar with a running indicator.
+      3. Switch between them while streaming. Expect A shows only numbers and B shows only letters.
+      4. Expect both finish and their sidebar indicators clear.
+
+  - id: desktop-delete-running-session
+    title: Deleting a running session from the sidebar stops it and removes it
+    priority: high
+    surfaces: [desktop]
+    requires: [ready]
+    touches: [apps/examples/desktop-app/webview/components/sidebar, apps/examples/desktop-app/sidecar]
+    refs: ["cline/cline#14308"]
+    minutes: 4
+    steps: |
+      1. Start a session: "Count slowly from 1 to 100, one number per line."
+      2. While streaming, delete it from the sidebar (context menu or trash icon); confirm.
+      3. Expect it disappears from the sidebar and the main pane shows an empty/new state.
+      4. Expect no error toast, and the app remains responsive: start a new session with "Say hi." and expect a reply.
+
+  - id: desktop-worktree-switch
+    title: The Worktree switch starts a task in a new git worktree
+    priority: high
+    surfaces: [desktop]
+    requires: [ready]
+    touches: [apps/examples/desktop-app/webview/components/composer, apps/examples/desktop-app/sidecar/worktree]
+    refs: ["cline/cline#14301", "cline/cline#14014"]
+    minutes: 6
+    steps: |
+      1. In the composer turn the Worktree switch on.
+      2. Send "Create wt.txt containing `worktree`."
+      3. Expect the session header shows a worktree branch name different from the main branch.
+      4. In a shell run `git -C ~/qa/scratch worktree list`. Expect two entries.
+      5. Expect ~/qa/scratch/wt.txt does NOT exist and the worktree path DOES contain wt.txt.
+      6. Turn the switch off. Send "Say hi." in a new session; expect it runs in ~/qa/scratch (header shows main branch).
+    invalidates: [scratch-repo]
+
+  - id: desktop-check-for-updates
+    title: Check for Updates in the app menu reports a result
+    priority: normal
+    surfaces: [desktop]
+    requires: [launched]
+    touches: [apps/examples/desktop-app/src-tauri, apps/examples/desktop-app/webview/components/updater]
+    refs: ["cline/cline#14276"]
+    minutes: 2
+    steps: |
+      1. Open the application menu (or tray menu) and click "Check for Updates".
+      2. Expect within 30 s a dialog or toast saying either up to date or an update is available. Expect no silent failure.
+      3. If an update is offered, dismiss it; do not install.
+
+  - id: desktop-settings-web-search-toggle
+    title: The Web Search toggle persists across restart
+    priority: normal
+    surfaces: [desktop]
+    requires: [launched]
+    touches: [apps/examples/desktop-app/sidecar/desktop-settings.ts, apps/examples/desktop-app/webview/components/settings]
+    minutes: 4
+    steps: |
+      1. Open Settings. Note the Web Search toggle state; flip it.
+      2. Quit the app fully (tray > Quit) and relaunch.
+      3. Expect the toggle shows the flipped state.
+      4. Flip it back.
+    invalidates: [launched]
+
+  - id: desktop-import-sessions-view
+    title: The Import view lists supported agents and handles an empty machine
+    priority: low
+    surfaces: [desktop]
+    requires: [launched]
+    touches: [apps/examples/desktop-app/webview/components/import]
+    minutes: 3
+    steps: |
+      1. Open Settings > Import.
+      2. Expect Claude Code and Codex are listed as sources.
+      3. Click Import Sessions. Expect either a list of found sessions or a clear "none found" message, never a spinner that does not resolve within 30 s.
+
+  - id: desktop-marketplace-search
+    title: Marketplace search returns skills, MCP servers, and plugins
+    priority: normal
+    surfaces: [desktop]
+    requires: [signed-in]
+    touches: [apps/examples/desktop-app/webview/components/marketplace]
+    minutes: 3
+    steps: |
+      1. Open Marketplace.
+      2. Type "github" in search.
+      3. Expect results within 10 s across at least two of: skills, MCP servers, plugins.
+      4. Open one result. Expect a detail view with an install/add action. Do not install.

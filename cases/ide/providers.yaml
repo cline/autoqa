@@ -1,0 +1,56 @@
+cases:
+  - id: sign-in-flow
+    title: Signing in with the Cline provider shows the account and balance
+    priority: smoke
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched]
+    touches: [sdk/packages/core/src/services/auth, apps/vscode/webview-ui/src/components/account]
+    minutes: 5
+    steps: |
+      1. If already signed in, sign out first.
+      2. Open provider settings, choose provider Cline, click Sign in. Complete the browser flow if one opens.
+      3. Expect the account view shows an account email and a balance within 60 s.
+      4. Expect a model can be selected and "Reply with exactly the word pong." gets "pong".
+    invalidates: [signed-in, provider-cline]
+
+  - id: switch-model
+    title: Changing the model in settings is used by the next request
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched, provider-cline]
+    touches: [sdk/packages/core/src/services/provider-settings, apps/vscode/webview-ui/src/components/settings]
+    minutes: 4
+    steps: |
+      1. In settings pick a model from a different family than the current one (a Gemini or GPT model via the Cline provider). Save.
+      2. New task: "Which model are you? Answer briefly." Send.
+      3. Expect the request succeeds and the chat header/metadata shows the newly selected model. (The model's self-report is not the assertion; the displayed model is.)
+      4. Switch back to the default model.
+
+  - id: byok-anthropic-edit
+    title: A file edit completes end to end on the Anthropic provider
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched, provider-anthropic, auto-approve-all]
+    touches: [sdk/packages/llms/src/providers/anthropic, sdk/packages/core/src/extensions/tools]
+    minutes: 4
+    steps: |
+      1. New task: "Create anthropic.txt in the workspace root containing exactly the line: via anthropic". Send.
+      2. Expect the chat header/metadata shows the Anthropic provider and claude-sonnet-4-5, not Cline.
+      3. Expect the write tool block appears and Cline reports completion within 90 s.
+      4. Expect `cat anthropic.txt` prints `via anthropic`.
+      5. Switch the provider back to Cline afterwards.
+    invalidates: [provider-cline]
+
+  - id: bad-key-error
+    title: An invalid API key produces a readable error, not a hang
+    priority: normal
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched]
+    touches: [sdk/packages/llms/src/providers, sdk/packages/core/src/session]
+    minutes: 3
+    steps: |
+      1. In settings choose provider Anthropic and enter key `sk-ant-invalid-autoqa`. Save.
+      2. Send "hi".
+      3. Expect an error message in the chat within 30 s mentioning authentication/401/invalid key, with a Retry control.
+      4. Expect the input is usable afterwards. Switch the provider back to Cline.
+    invalidates: [provider-cline]

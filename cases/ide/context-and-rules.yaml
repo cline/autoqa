@@ -1,0 +1,58 @@
+cases:
+  - id: at-mention-file
+    title: An @file mention puts the file's content into context
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [apps/vscode/webview-ui/src/components/chat/ContextMenu, sdk/packages/core/src/session/services]
+    minutes: 4
+    steps: |
+      1. In a shell write `secret-ingredient: cardamom` to ~/qa/scratch/recipe.txt.
+      2. In the chat type "@" and expect a file picker popup. Type "recipe" and pick recipe.txt.
+      3. Finish the message: " what is the secret ingredient? Answer with one word." Send.
+      4. Expect the reply contains "cardamom" without Cline needing to call a read-file tool (a read tool call is acceptable but note it).
+
+  - id: workspace-rules-applied
+    title: A .cline/rules file changes Cline's behaviour and is listed in the rules UI
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [sdk/packages/core/src/services/rules, apps/vscode/webview-ui/src/components/cline-rules]
+    refs: ["cline/cline#14207"]
+    minutes: 5
+    steps: |
+      1. In a shell: mkdir -p ~/qa/scratch/.cline/rules and write "Always end every reply with the word BANANA." to ~/qa/scratch/.cline/rules/banana.md.
+      2. Start a new task (so rules reload). Send "Say hi."
+      3. Expect the reply ends with BANANA.
+      4. Open the rules UI (rules toggle / Customize > Rules). Expect banana.md listed and enabled.
+      5. Disable it there, new task, "Say hi." Expect no BANANA.
+      6. Delete the rules file afterwards.
+
+  - id: clineignore-blocks-read
+    title: A file listed in .clineignore cannot be read by Cline
+    priority: normal
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [sdk/packages/core/src/services/ignore]
+    minutes: 4
+    steps: |
+      1. Write `token=abc123` to ~/qa/scratch/private.env and write `private.env` to ~/qa/scratch/.clineignore.
+      2. New task: "Read private.env and tell me the token." Send.
+      3. Expect Cline reports it cannot access the file (blocked/ignored) and the reply does NOT contain abc123.
+      4. Remove .clineignore afterwards.
+
+  - id: history-delete
+    title: Deleting a task from history removes it and does not affect other tasks
+    priority: normal
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched, provider-cline]
+    touches: [sdk/packages/core/src/session/history, apps/vscode/webview-ui/src/components/history]
+    refs: ["cline/cline#14285"]
+    minutes: 4
+    steps: |
+      1. Create two tasks: "codeword alpha" then new task "codeword beta"; wait for a reply to each.
+      2. Open history. Expect both listed.
+      3. Delete the alpha task via its delete control; confirm if asked.
+      4. Expect alpha is gone and beta remains. Open beta; expect it loads.
+      5. Restart the surface (close and relaunch). Expect history still shows beta and not alpha.
+    invalidates: [launched]

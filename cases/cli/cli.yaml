@@ -1,0 +1,148 @@
+# CLI cases. Headless ones need only a shell; TUI ones need the terminal on screen.
+cases:
+  - id: cli-version-and-doctor
+    title: cline version and cline doctor run cleanly
+    priority: smoke
+    surfaces: [cli]
+    requires: [installed]
+    touches: [apps/cli/src/commands]
+    minutes: 2
+    steps: |
+      1. Run `cline version`. Expect a semver string and exit code 0.
+      2. Run `cline doctor`. Expect exit 0 and no line marked as an error (warnings about missing optional providers are fine). Save the output in the notes.
+
+  - id: cli-headless-json
+    title: cline --json emits newline-delimited JSON and exits 0
+    priority: smoke
+    surfaces: [cli]
+    requires: [installed, provider-cline]
+    touches: [apps/cli/src/runtime/run-agent.ts, apps/cli/src/output]
+    minutes: 3
+    steps: |
+      1. In ~/qa/scratch run `cline --json "Reply with exactly the word pong."` and capture stdout.
+      2. Expect exit code 0.
+      3. Expect every non-empty stdout line parses as JSON with a `type` of "say" or "ask".
+      4. Expect at least one line whose `text` contains "pong".
+
+  - id: cli-headless-auto-approve-edit
+    title: A headless task edits a file with default auto-approve
+    priority: smoke
+    surfaces: [cli]
+    requires: [installed, provider-cline, scratch-repo]
+    touches: [apps/cli/src/runtime, sdk/packages/core/src/extensions/tools]
+    minutes: 4
+    steps: |
+      1. In ~/qa/scratch run `cline "Create cli.txt containing exactly the line: from the cli"` and wait for exit.
+      2. Expect exit 0 and no approval prompt.
+      3. Expect `cat cli.txt` prints `from the cli`.
+
+  - id: cli-stdin-pipe
+    title: Piped stdin is available as context in a headless task
+    priority: high
+    surfaces: [cli]
+    requires: [installed, provider-cline]
+    touches: [apps/cli/src/runtime/prompt.ts]
+    minutes: 3
+    steps: |
+      1. Run `echo "codeword heron" | cline "What is the codeword in the input? One word."` (PowerShell: `"codeword heron" | cline "..."`).
+      2. Expect the output contains "heron".
+
+  - id: cli-plan-flag
+    title: cline -p runs in plan mode and does not edit files
+    priority: high
+    surfaces: [cli]
+    requires: [installed, provider-cline, scratch-repo]
+    touches: [apps/cli/src/runtime, sdk/packages/core/src/session/prompts]
+    minutes: 3
+    steps: |
+      1. Run `cline -p "Add a line `planned` to README.md"`.
+      2. Expect exit 0 and output describing a plan.
+      3. Expect README.md is unchanged (`cat README.md` shows only `hello`).
+
+  - id: cli-tui-launch-and-reply
+    title: The TUI starts, accepts a message, and streams a reply
+    priority: smoke
+    surfaces: [cli]
+    requires: [launched, provider-cline]
+    touches: [apps/cli/src/tui]
+    minutes: 3
+    steps: |
+      1. In the TUI type "Reply with exactly the word pong." and press Enter.
+      2. Expect a streamed assistant reply containing "pong" within 60 s.
+      3. Expect the prompt returns to an input state.
+
+  - id: cli-tui-settings-dialog
+    title: /settings in the TUI opens the provider/model dialog
+    priority: high
+    surfaces: [cli]
+    requires: [launched]
+    touches: [apps/cli/src/tui/components/dialogs, apps/cli/src/tui/commands]
+    minutes: 3
+    steps: |
+      1. Type "/settings" and press Enter.
+      2. Expect a dialog listing provider and model. Screenshot.
+      3. Press Escape. Expect the chat view returns.
+
+  - id: cli-tui-ask-question-text
+    title: Typing a custom answer to a TUI question keeps the typed text
+    priority: high
+    surfaces: [cli]
+    requires: [launched, provider-cline]
+    touches: [apps/cli/src/tui/components/dialogs]
+    refs: ["cline/cline#14274"]
+    minutes: 4
+    steps: |
+      1. Send "Use your ask-question tool to ask my favourite colour with options red and blue, then reply with my answer."
+      2. Expect a question dialog. Choose the custom/other input and type "green".
+      3. Expect "green" remains visible in the field while typing (no characters lost). Press Enter.
+      4. Expect the reply says green.
+
+  - id: cli-history-list-and-resume
+    title: cline history lists the last task and --id resumes it
+    priority: high
+    surfaces: [cli]
+    requires: [installed, provider-cline]
+    touches: [apps/cli/src/commands/history.ts, sdk/packages/core/src/session/history]
+    minutes: 4
+    steps: |
+      1. Run `cline "Remember the codeword osprey."`.
+      2. Run `cline history`. Expect a row for that task with an id.
+      3. Run `cline --id <that id> "What was the codeword? One word."`. Expect output containing "osprey".
+
+  - id: cli-anthropic-provider-flag
+    title: -P anthropic uses the Anthropic key from the environment for a headless task
+    priority: high
+    surfaces: [cli]
+    requires: [installed, provider-anthropic, scratch-repo]
+    touches: [apps/cli/src/runtime, sdk/packages/llms/src/providers/anthropic]
+    minutes: 3
+    steps: |
+      1. In ~/qa/scratch run `cline -P anthropic -m claude-sonnet-4-5 --json "Create anthropic.txt containing exactly the line: via anthropic"`.
+      2. Expect exit 0 and `cat anthropic.txt` prints `via anthropic`.
+      3. Expect the JSON output's model metadata names claude-sonnet-4-5 and no line mentions the Cline provider.
+
+  - id: cli-release-telemetry-key
+    title: A release build sends telemetry with the production key
+    priority: normal
+    surfaces: [cli]
+    builds: [release]
+    requires: [installed, provider-cline]
+    setup:
+      - Telemetry is enabled (`cline config` shows telemetry on; unset CLINE_TELEMETRY_DISABLED).
+    touches: [apps/cli/src/services/telemetry, sdk/packages/core/src/services/telemetry]
+    minutes: 4
+    steps: |
+      1. Run `cline "Say hi."` with `CLINE_LOG_LEVEL=debug`.
+      2. Expect the log (~/.cline/data/logs) shows a telemetry flush to the production endpoint with no "missing key" or "telemetry disabled" message.
+      3. Expect no telemetry request is made to a localhost or staging host.
+
+  - id: cli-hub-status
+    title: cline hub status reports a running hub after a task
+    priority: normal
+    surfaces: [cli]
+    requires: [installed, provider-cline]
+    touches: [apps/cline-hub, apps/cli/src/commands/hub.ts]
+    minutes: 2
+    steps: |
+      1. Run `cline "Say hi."` then `cline hub status`.
+      2. Expect status reports a running hub with a port and version, exit 0.

@@ -1,0 +1,21 @@
+{
+  "name": "autoqa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent-run QA for Cline: checked-in cases, prerequisite tracking, and run artifacts.",
+  "scripts": {
+    "validate": "bun src/validate.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "bun test",
+    "smoke": "bun .cline/plugins/autoqa/smoke.ts"
+  },
+  "dependencies": {
+    "yaml": "^2.8.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.8.0"
+  }
+}

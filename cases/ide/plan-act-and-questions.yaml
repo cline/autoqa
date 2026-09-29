@@ -1,0 +1,56 @@
+cases:
+  - id: plan-mode-no-edits
+    title: Plan mode refuses to edit files and offers to switch to Act
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [sdk/packages/core/src/session/prompts, apps/vscode/webview-ui/src/components/chat]
+    minutes: 4
+    steps: |
+      1. Switch the mode toggle to Plan.
+      2. New task: "Add a second line to README.md that says `planned`." Send.
+      3. Expect Cline describes a plan and does NOT change README.md (`cat README.md` shows only `hello`).
+      4. Expect a visible way to switch to Act (toggle or button in the reply).
+      5. Switch to Act. Expect Cline then edits the file and README.md contains `planned`.
+      6. Switch back to Act mode as the default for later cases.
+
+  - id: ask-question-choice
+    title: Clicking an option on an ask-question card answers it
+    priority: high
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [apps/vscode/webview-ui/src/components/chat, sdk/packages/core/src/extensions/tools]
+    refs: ["cline/cline#14275"]
+    minutes: 4
+    steps: |
+      1. New task: "Use your ask-question tool to ask me whether I prefer tea or coffee, with those two options. Then reply with my choice." Send.
+      2. Expect a question card with two selectable options.
+      3. Click "coffee".
+      4. Expect the card shows coffee selected and the assistant's next message says coffee.
+
+  - id: ask-question-custom-text
+    title: Typing a custom answer to an ask-question card is accepted
+    priority: normal
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [ready]
+    touches: [apps/vscode/webview-ui/src/components/chat]
+    refs: ["cline/cline#14275"]
+    minutes: 4
+    steps: |
+      1. New task: "Use your ask-question tool to ask me my favourite colour with options red and blue. Reply with whatever I answer." Send.
+      2. Expect a question card. Instead of clicking an option, type "green" in the chat input and send.
+      3. Expect the assistant's next message says green.
+
+  - id: new-task-clears-chat
+    title: Starting a new task clears the chat and the previous task appears in history
+    priority: smoke
+    surfaces: [desktop, vscode, jetbrains]
+    requires: [launched, provider-cline]
+    touches: [sdk/packages/core/src/session, apps/vscode/webview-ui/src/components/history]
+    minutes: 3
+    steps: |
+      1. Send "Remember the codeword falcon." and wait for a reply.
+      2. Click the new task / plus button.
+      3. Expect an empty chat with the input focused.
+      4. Open history (clock icon / sidebar list). Expect the falcon task is listed with a recent timestamp.
+      5. Click it. Expect the falcon conversation reloads intact.

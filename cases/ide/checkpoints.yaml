@@ -1,0 +1,51 @@
+cases:
+  - id: checkpoint-indicator-appears
+    title: A checkpoint indicator appears after a file edit
+    priority: high
+    surfaces: [vscode, jetbrains]
+    requires: [ready, checkpoints-enabled]
+    touches: [sdk/packages/core/src/services/checkpoints, apps/vscode/webview-ui/src/components/chat]
+    minutes: 4
+    steps: |
+      1. New task: "Create notes.txt containing the single line `one`." Send; wait for completion.
+      2. Expect a checkpoint marker (bookmark icon or "Checkpoint" label) with Compare and Restore controls next to the edit.
+
+  - id: checkpoint-compare
+    title: The Compare button on a checkpoint opens a diff of the edit
+    priority: normal
+    surfaces: [vscode, jetbrains]
+    requires: [ready, checkpoints-enabled]
+    touches: [sdk/packages/core/src/services/checkpoints, apps/vscode/src/integrations/editor]
+    minutes: 4
+    steps: |
+      1. New task: "Create notes.txt containing the single line `one`." Wait for completion.
+      2. Click Compare on the checkpoint.
+      3. Expect a diff view opens in the editor showing notes.txt added with `one`.
+      4. Close the diff.
+
+  - id: checkpoint-restore-files
+    title: Restore Files on a checkpoint reverts the workspace but keeps the conversation
+    priority: high
+    surfaces: [vscode, jetbrains]
+    requires: [ready, checkpoints-enabled]
+    touches: [sdk/packages/core/src/services/checkpoints]
+    minutes: 6
+    steps: |
+      1. New task: "Create notes.txt with the line `one`." Wait. Then send "Now change it to `two`." Wait.
+      2. Expect `cat notes.txt` shows `two`.
+      3. Click Restore on the FIRST checkpoint (the `one` edit) and choose the files-only option ("Restore Files" / "Restore Workspace Only").
+      4. Expect `cat notes.txt` shows `one`.
+      5. Expect both user messages are still visible in the chat.
+
+  - id: checkpoint-restore-task
+    title: Restore Task Only rewinds the conversation but keeps the files
+    priority: normal
+    surfaces: [vscode, jetbrains]
+    requires: [ready, checkpoints-enabled]
+    touches: [sdk/packages/core/src/services/checkpoints]
+    minutes: 6
+    steps: |
+      1. New task: "Create notes.txt with the line `one`." Wait. Send "Now change it to `two`." Wait.
+      2. Click Restore on the FIRST checkpoint and choose "Restore Task Only".
+      3. Expect the second user message ("change it to two") is gone from the chat.
+      4. Expect `cat notes.txt` still shows `two`.

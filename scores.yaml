@@ -1,0 +1,23 @@
+# Extra weight per case from independent producers. The crawl only reads
+# this; it never writes it. Hand-maintained for now; producers to follow:
+# git churn against `touches`, staleness from runs/, developer requests.
+#
+# Scale: priority weights are smoke 100 / high 50 / normal 20 / low 5, so a
+# score of 40 lifts a normal case above an untouched high one.
+
+desktop-delete-running-session:
+  - { source: churn, score: 40, reason: "#14308 merged 2026-09-19" }
+desktop-worktree-switch:
+  - { source: churn, score: 40, reason: "#14301 and #14014 merged 2026-09-18/19" }
+desktop-check-for-updates:
+  - { source: churn, score: 30, reason: "#14276 merged 2026-09-18" }
+ask-question-choice:
+  - { source: churn, score: 30, reason: "#14275 merged 2026-09-18" }
+ask-question-custom-text:
+  - { source: churn, score: 30, reason: "#14275 merged 2026-09-18" }
+workspace-rules-applied:
+  - { source: churn, score: 30, reason: "#14207 merged 2026-09-18" }
+history-delete:
+  - { source: churn, score: 30, reason: "#14285 merged 2026-09-21" }
+cli-tui-ask-question-text:
+  - { source: churn, score: 30, reason: "#14274 merged 2026-09-19" }
