@@ -5,7 +5,9 @@
   "type": "module",
   "description": "Cline plugin: semantic interface over the autoqa test plan and run directory.",
   "cline": {
-    "plugins": ["./autoqa.ts"]
+    "plugins": [
+      { "paths": ["./autoqa.ts"] }
+    ]
   },
   "dependencies": {
     "yaml": "^2.8.0",
