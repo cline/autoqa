@@ -1,5 +1,7 @@
-import {App} from '@slack/bolt';
+import {App, type KnownEventFromType} from '@slack/bolt';
 import {WebClient, LogLevel} from '@slack/web-api';
+
+import {Chatter} from './slack/chat.ts';
 
 const client = new WebClient(process.env.SLACK_BOT_TOKEN, {
     logLevel: LogLevel.DEBUG
@@ -11,6 +13,8 @@ const app = new App({
     socketMode: true,
 });
 
+// TODO: use 'hello' instead
+// https://docs.slack.dev/reference/events/hello
 const authResult = await app.client.auth.test({ token: process.env.SLACK_BOT_TOKEN });
 const myId = authResult.user_id;
 
@@ -24,7 +28,7 @@ async function sleep(ms: number): Promise<void> {
     });
 }
 
-const mentions = new Map<string,{ts: string, count: number}>();
+const mentions = new Map<string,{ts: string, chatter: Chatter}>();
 
 // Computes a key for a thread we have been mentioned in.
 function key(event: {channel: string, ts: string, thread_ts?: string}): string {
@@ -66,42 +70,16 @@ function isBuzzOff(event: {text?: string}): boolean {
     return event.text && event.text.indexOf(`<@${myId}> bye`) !== -1;
 }
 
-app.event('app_mention', async ({ event, sayStream, setStatus, client }) => {
-    console.log(JSON.stringify(event, null, 2));
-
-    const context = mentions.get(key(event));
-    if (!context) {
-        // This is a new tag for us.
-        // Enter this mention into the mentions array.
-        mentions.set(key(event), {ts: event.thread_ts || event.ts, count: 0});
-
-        await setStatus({
-            status: 'is thinking...',
-            loading_messages: shuffled(loadingText).slice(0, 5),
-        });
-
-        const stream = sayStream();
-        await stream.append({markdown_text: `PONG ${event.text}`});
-        await sleep(1000);
-        await stream.stop();
-    } else {
-        console.log (`tagged in existing thread, ${event.text}`);
-
-        // Check if we're being told to buzz off.
-        if (isBuzzOff(event)) {
-            mentions.delete(key(event))
-            await client.reactions.add({
-                channel: event.channel,
-                timestamp: event.ts,
-                name: 'wave',
-            })
-        }
-
-        // TODO: Handle whatever mention is happening here
+// Gets whether the specified user ID, for example U012AB3CD, is tagged in the message.
+function userIsTagged(event: KnownEventFromType<'message'>, userId: string): boolean {
+    if (!/^[A-Z0-9]+$/.test(userId)) {
+        throw new Error(`not a user ID: "${userId}"`);
     }
-});
+    const re = new RegExp(`\<@${userId}\>`)
+    return re.test(event.text);
+}
 
-app.event('message', async ({event, say}) => {
+app.event('message', async ({event, say, setStatus, client}) => {
     // Skip our own messages.
     //
     // Unfortunately, Slack's types are complete garbage so this can't be typed without
@@ -112,21 +90,46 @@ app.event('message', async ({event, say}) => {
 
     console.log('message', JSON.stringify(event, null, 2));
 
-    if (!('thread_ts' in event)) {
-        console.log('not a thread_ts event');
-        return;
-    }
-    console.log(`thread ts: ${event.thread_ts}\n${key(event)}`);
-    for (const [key, value] of mentions.entries()) {
-        console.log(`- ${key}: ${JSON.stringify(value)}`);
+    let context = mentions.get(key(event));
+    if (!context && userIsTagged(event, myId)) {
+        // This is a new tag for us.
+
+        // Spawn a worker to handle inference.
+        const chatter = new Chatter(key(event), (text: string) => {
+            say({
+                text,
+                thread_ts: event.thread_ts || event.ts,
+            });
+        });
+
+        // Enter this mention into the mentions array.
+        context = {ts: event.thread_ts || event.ts, chatter};
+        mentions.set(key(event), context);
+
+        await setStatus({
+            status: 'is thinking...',
+            loading_messages: shuffled(loadingText).slice(0, 5),
+        });
     }
 
-    const context = mentions.get(key(event));
-    if (context && !isBuzzOff(event)) {
-        await say({
-            thread_ts: context.ts,
-            text: `this is the ${++context.count}-th message`,
-        });
+    if (!('thread_ts' in event))
+    {
+        console.log('not a threaded message');
+        return
+    }
+
+    console.log (`tagged in existing thread, ${event.text}`);
+
+    // Check if we're being told to buzz off.
+    if (isBuzzOff(event)) {
+        mentions.delete(key(event))
+        await client.reactions.add({
+            channel: event.channel,
+            timestamp: event.ts,
+            name: 'wave',
+        })
+    } else {
+        context.chatter.onSlackMessage(event)
     }
 });
 
