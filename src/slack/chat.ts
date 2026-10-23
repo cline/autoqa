@@ -8,10 +8,12 @@ export class Chatter {
     private readonly key: string;
     private readonly worker: Worker;
     private readonly say: (message: string) => void;
+    private readonly setStatus: (status: {text: string}) => void;
 
-    constructor(key: string, say: (string) => void) {
+    constructor(key: string, say: (string) => void, setStatus: (status: {text: string}) => void) {
         this.key = key
         this.say = say
+        this.setStatus = setStatus
         this.worker = spawnChatWorker({key})
 
         this.worker.on('message', (msg) => {
@@ -32,6 +34,9 @@ export class Chatter {
     private fromWorker(event: any) {
         if (event.type === 'say') {
             this.say(event.text);
+        } else if (event.type === 'setStatus') {
+            console.log('set status (worker)');
+            this.setStatus(event.status);
         }
     }
 }

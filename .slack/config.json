@@ -28,7 +28,6 @@
   "settings": {
     "event_subscriptions": {
       "bot_events": [
-        "app_mention",
         "message.im",
         "message.channels",
         "message.groups",

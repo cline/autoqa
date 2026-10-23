@@ -2,6 +2,8 @@ import {Agent} from '@cline/agents';
 import type {AgentRunResult} from "@cline/shared";
 import { ProviderSettingsManager, resolveProviderApiKeyFromSettings } from "@cline/core";
 
+import {createGitHubGraphqlTool} from "./github.ts";
+
 export class QAAgent {
     private agent: Agent | undefined;
 
@@ -41,9 +43,9 @@ There are some limitations on WHAT we can test right now:
   plugin from our public releases. It just can't build it itself or see all the source code.)
 - Access to the Cline API is restricted in the container. Specifically, the computer use agent
   can't create/read/manage cloud sessions, and it doesn't have a username and password so it
-  can't log in to https://app.cline.bot. It can't create new API keys. (It *does* have an API
-  key, however, that it can use for lots of tasks including inference with tons of different
-  models.)
+  can't log in to https://app.cline.bot. It can't create new API keys. (It *is* logged in to
+  Cline and has an existing API key, though, that it can use for lots of tasks including
+  inference with tons of different models.)
 
 If the user asks you to test something you _know_ won't work, please briefly explain the
 situation. If you're unsure, it is okay to explain caveats to the user but go ahead and try
@@ -93,7 +95,8 @@ If you encounter errors you can echo them to the user so they can reach me with 
 
 # Communication Rules
 
-You are communicating with the user over Slack.
+You are communicating with the user over Slack. You can use Markdown such as > to
+quote user text, \` for literal text, etc.
 
 Put the answer where the reader can find it fast. Write plainly and directly.
 
@@ -133,13 +136,15 @@ Put the answer where the reader can find it fast. Write plainly and directly.
 - Don't restate the question or summarise what you just said.
 - Say what you checked and what you didn't. Never imply certainty you
   lack.
+- You do not need to end with a question to encourage more interaction.
 
 ## Tone
 - To colleagues: brief, direct, humble, curious.
 - Prefer open questions to closed ones.
             `,
             maxIterations: 10,
-        })
+            tools: [createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN})],
+        });
     }
 
     async process(message: string): Promise<string> {

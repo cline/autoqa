@@ -100,14 +100,15 @@ app.event('message', async ({event, say, setStatus, client}) => {
                 text,
                 thread_ts: event.thread_ts || event.ts,
             });
-        });
+        }, setStatus);
 
         // Enter this mention into the mentions array.
         context = {ts: event.thread_ts || event.ts, chatter};
         mentions.set(key(event), context);
 
+        console.log('set status (outer)');
         await setStatus({
-            status: 'is thinking...',
+            status: 'active',
             loading_messages: shuffled(loadingText).slice(0, 5),
         });
     }
@@ -123,14 +124,22 @@ app.event('message', async ({event, say, setStatus, client}) => {
     // Check if we're being told to buzz off.
     if (isBuzzOff(event)) {
         mentions.delete(key(event))
+        await setStatus({
+            status: ''
+        });
         await client.reactions.add({
             channel: event.channel,
             timestamp: event.ts,
             name: 'wave',
         })
-    } else {
-        context.chatter.onSlackMessage(event)
+        return;
     }
+
+    if (!context) {
+        return;
+    }
+
+    context.chatter.onSlackMessage(event);
 });
 
 (async () => {
