@@ -1,8 +1,21 @@
+import { readFileSync } from 'node:fs';
+
 import {Agent} from '@cline/agents';
 import type {AgentRunResult} from "@cline/shared";
 import { ProviderSettingsManager, resolveProviderApiKeyFromSettings } from "@cline/core";
 
+import {createControlTowerTools} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
+
+function readWindowsAsset(name: string): string {
+    // assets/ sits two levels above this file, both in src/worker/ and in dist/worker/.
+    const text = readFileSync(new URL(`../../assets/${name}`, import.meta.url), 'utf8');
+    // Windows editors often save a byte-order mark; it must not count as part of the script.
+    // Windows needs \r\n-style line endings.
+    return text.replace(/^\uFEFF/, '').replace('\n', '\r\n');
+}
+
+export const SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
 
 export class QAAgent {
     private agent: Agent | undefined;
@@ -143,7 +156,15 @@ Put the answer where the reader can find it fast. Write plainly and directly.
 - Prefer open questions to closed ones.
             `,
             maxIterations: 10,
-            tools: [createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN})],
+            tools: [
+                createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN}),
+                ...createControlTowerTools({
+                    baseUrl: 'http://127.0.0.1:18091',   // tunnel now, co-located later; same URL either way
+                    promptPreamble: '',
+                    setupScript: SETUP_SCRIPT,          // optional
+                    source: 'autoqa',
+                }),
+            ],
         });
     }
 

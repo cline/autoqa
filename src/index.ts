@@ -95,9 +95,9 @@ app.event('message', async ({event, say, setStatus, client}) => {
         // This is a new tag for us.
 
         // Spawn a worker to handle inference.
-        const chatter = new Chatter(key(event), (text: string) => {
+        const chatter = new Chatter(key(event), (markdown_text: string) => {
             say({
-                text,
+                markdown_text,
                 thread_ts: event.thread_ts || event.ts,
             });
         }, setStatus);
