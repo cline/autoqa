@@ -1,11 +1,12 @@
 import { readFileSync } from 'node:fs';
 
 import {Agent} from '@cline/agents';
-import type {AgentRunResult} from "@cline/shared";
 import { ProviderSettingsManager, resolveProviderApiKeyFromSettings } from "@cline/core";
 
 import {createControlTowerTools} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
+import type {ScratchStorage} from "./scratch-storage.ts";
+import {Curator} from "./artifacts.ts";
 
 function readWindowsAsset(name: string): string {
     // assets/ sits two levels above this file, both in src/worker/ and in dist/worker/.
@@ -15,17 +16,24 @@ function readWindowsAsset(name: string): string {
     return text.replace(/^\uFEFF/, '').replace('\n', '\r\n');
 }
 
+export function controlTowerBaseUrl(): string {
+    return process.env.CONTROL_TOWER_BASE_URL || 'http://127.0.0.1:18091';
+}
+
 export const SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
 
 export class QAAgent {
+    private readonly storage: ScratchStorage;
     private agent: Agent | undefined;
 
-    constructor() {
+    constructor(storage: ScratchStorage) {
+        this.storage = storage;
     }
 
-    async start(): Promise<void> {
+    async start(notify: (message: string) => void): Promise<void> {
         const providerSettingsManager = new ProviderSettingsManager();
         const apiKey = resolveProviderApiKeyFromSettings(providerSettingsManager, "cline");
+        const curator = new Curator(this.storage, notify);
         this.agent = new Agent({
             providerId: 'cline',
             apiKey: apiKey || process.env.CLINE_API_KEY,
@@ -111,8 +119,12 @@ If you encounter errors you can echo them to the user so they can reach me with 
 
 # Communication Rules
 
-You are communicating with the user over Slack. You can use Markdown such as > to
-quote user text, \` for literal text, etc.
+You are communicating the user (maybe multiple users!) over Slack:
+- You can use Markdown such as > to quote user text, \` for literal text, etc.
+- If you ever receive a message, but you have nothing to add (for example one user is
+  addressing another) then reply with one word \`GOTCHA\` and we will not forward
+  your reply to the humans' conversation thread.
+- Feel free to chime in when you have useful information to add.
 
 Put the answer where the reader can find it fast. Write plainly and directly.
 
@@ -162,11 +174,12 @@ Put the answer where the reader can find it fast. Write plainly and directly.
             tools: [
                 createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN}),
                 ...createControlTowerTools({
-                    baseUrl: 'http://127.0.0.1:18091',   // tunnel now, co-located later; same URL either way
+                    baseUrl: controlTowerBaseUrl(),     // tunnel now, co-located later; same URL either way
                     promptPreamble: '',
                     setupScript: SETUP_SCRIPT,          // optional
                     source: 'autoqa',
                 }),
+                ...curator.createTools(),
             ],
         });
     }
@@ -179,8 +192,7 @@ Put the answer where the reader can find it fast. Write plainly and directly.
     }
 }
 
-// TODO: conversation
-// TODO: conversation key
+// TODO: async updates from the container
 
 // TODO: whiteboard
 //
@@ -189,6 +201,3 @@ Put the answer where the reader can find it fast. Write plainly and directly.
 // There are many instances of you, each handling one Slack thread. To coordinate amongst threads,
 // you have a shared whiteboard. Use your tools to read, update and erase the whiteboard. The
 // whiteboard has a fixed maximum size so you must evict an item if the whiteboard is full.
-
-// TODO: container running, etc.
-// TODO: observatory

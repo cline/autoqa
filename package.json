@@ -20,7 +20,8 @@
   },
   "dependencies": {
     "@cline/sdk": "^0.0.95",
-    "@slack/bolt": "^5.1.0"
+    "@slack/bolt": "^5.1.0",
+    "tar": "^7.5.22"
   },
   "allowScripts": {
     "protobufjs@7.6.6": true

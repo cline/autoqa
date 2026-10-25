@@ -93,6 +93,7 @@ app.event('message', async ({event, say, setStatus, client}) => {
     let context = mentions.get(key(event));
     if (!context && userIsTagged(event, myId)) {
         // This is a new tag for us.
+        console.log(`new tag in thread ${event.ts}`);
 
         // Spawn a worker to handle inference.
         const chatter = new Chatter(key(event), (markdown_text: string) => {
@@ -112,8 +113,7 @@ app.event('message', async ({event, say, setStatus, client}) => {
             loading_messages: shuffled(loadingText).slice(0, 5),
         });
     }
-
-    if (!('thread_ts' in event))
+    else if (!('thread_ts' in event))
     {
         console.log('not a threaded message');
         return

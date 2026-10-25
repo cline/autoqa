@@ -7,6 +7,8 @@ export interface ControlTowerOptions {
     workerProfile?: string;
     /** Instructions every job needs for the Windows setup to succeed; prepended to each task. */
     promptPreamble?: string;
+    /** Appended after each task, e.g. how to report results. */
+    promptSuffix?: string;
     setupScript?: string;
     /** Tags submissions. cancel_qa_job only acts on jobs with this source. */
     source?: string;
@@ -63,7 +65,7 @@ export function createControlTowerTools(options: ControlTowerOptions = {}) {
                     worker_profile: options.workerProfile ?? 'windows',
                     title: input.title,
                     source,
-                    prompt: options.promptPreamble ? `${options.promptPreamble}\n\n${input.task}` : input.task,
+                    prompt: [options.promptPreamble, input.task, options.promptSuffix].filter(Boolean).join('\n\n'),
                     setup_script: options.setupScript ?? '',
                 },
                 context.signal,
