@@ -5,8 +5,9 @@ import { ProviderSettingsManager, resolveProviderApiKeyFromSettings } from "@cli
 
 import {createControlTowerTools} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
-import type {ScratchStorage} from "./scratch-storage.ts";
+import type {ScratchStorage} from "../common/scratch-storage.ts";
 import {Curator} from "./artifacts.ts";
+import type {UploadFileResult} from "../common/types.ts";
 
 function readWindowsAsset(name: string): string {
     // assets/ sits two levels above this file, both in src/worker/ and in dist/worker/.
@@ -22,18 +23,26 @@ export function controlTowerBaseUrl(): string {
 
 export const SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
 
+export interface Slacker {
+    uploadFile(filename: string): Promise<UploadFileResult>,
+}
+
 export class QAAgent {
     private readonly storage: ScratchStorage;
+    private readonly slacker: Slacker;
+    private readonly notify: (message: string) => void;
     private agent: Agent | undefined;
 
-    constructor(storage: ScratchStorage) {
+    constructor(storage: ScratchStorage, notify: (message: string) => void, slacker: Slacker) {
         this.storage = storage;
+        this.notify = notify;
+        this.slacker = slacker;
     }
 
-    async start(notify: (message: string) => void): Promise<void> {
+    async start(): Promise<void> {
         const providerSettingsManager = new ProviderSettingsManager();
         const apiKey = resolveProviderApiKeyFromSettings(providerSettingsManager, "cline");
-        const curator = new Curator(this.storage, notify);
+        const curator = new Curator(this.storage, this.notify, this.slacker);
         this.agent = new Agent({
             providerId: 'cline',
             apiKey: apiKey || process.env.CLINE_API_KEY,

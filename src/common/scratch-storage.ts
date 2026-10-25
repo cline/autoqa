@@ -16,9 +16,12 @@ export class ScratchStorage implements AsyncDisposable {
         return this._root.path;
     }
 
+    // Checks whether `s` is inside the root of this storage, and returns `s` as an absolute path.
+    // `s` may be specified as a relative OR absolute path.
     public async checked(s: string): Promise<string> {
         const root = await this.root();
-        const p = path.resolve(path.join(root, s));
+        console.log(root, s)
+        const p = path.resolve(root, s);
         const relative = path.relative(root, p);
         if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
             return p;

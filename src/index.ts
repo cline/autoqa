@@ -2,6 +2,11 @@ import {App, type KnownEventFromType} from '@slack/bolt';
 import {WebClient, LogLevel} from '@slack/web-api';
 
 import {Chatter} from './slack/chat.ts';
+import {ScratchStorage} from "./common/scratch-storage.ts";
+import * as os from "node:os";
+import * as path from "node:path";
+
+const storage = new ScratchStorage(os.tmpdir(), `autoqa-${process.pid}-${Date.now()}`);
 
 const client = new WebClient(process.env.SLACK_BOT_TOKEN, {
     logLevel: LogLevel.DEBUG
@@ -96,18 +101,44 @@ app.event('message', async ({event, say, setStatus, client}) => {
         console.log(`new tag in thread ${event.ts}`);
 
         // Spawn a worker to handle inference.
-        const chatter = new Chatter(key(event), (markdown_text: string) => {
-            say({
-                markdown_text,
-                thread_ts: event.thread_ts || event.ts,
-            });
-        }, setStatus);
+        const slacker = {
+            say(markdown_text: string): void {
+                say({
+                    markdown_text,
+                    thread_ts: event.thread_ts || event.ts,
+                });
+            },
+            setStatus(status: {text: string}) {
+                setStatus(status);
+            },
+            async uploadFile(filename: string): Promise<string> {
+                console.log(`checking ${filename} against storage root`)
+                const filePath = await storage.checked(filename);
+                console.log(`resolved filename to ${filePath}`);
+                // TODO: let the agent share Markdown, etc. files here with a channel.
+                let result
+                try {
+                    result = await client.filesUploadV2({
+                        file: filePath,
+                        filename: path.basename(filePath),
+                    });
+                } catch (error) {
+                    // TODO: hunt down and eliminate the sources of these errors.
+                    console.error(error, error.stack);
+                }
+                if (!result || !result.ok) {
+                    throw new Error(`File upload failed: ${JSON.stringify(result?.response_metadata)}`);
+                }
+                console.log(`sclerotic files API has result: ${JSON.stringify(result)}`);
+                return result;
+            },
+        };
+        const chatter = new Chatter(key(event), slacker, await storage.root());
 
         // Enter this mention into the mentions array.
         context = {ts: event.thread_ts || event.ts, chatter};
         mentions.set(key(event), context);
 
-        console.log('set status (outer)');
         await setStatus({
             status: 'active',
             loading_messages: shuffled(loadingText).slice(0, 5),
