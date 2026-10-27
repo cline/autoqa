@@ -35,7 +35,7 @@ interface JobList { jobs: Job[] }
 
 export class ControlTower {
     private readonly watchedJobs = new Map<string, string>()
-    private watcherTimeout: NodeJS.Timeout | undefined
+    private watcherInterval: NodeJS.Timeout | undefined
     private readonly client: ReturnType<typeof createClient>;
     // TODO: These should vary by job type, but we only have one job type!
     private readonly configurationOptions: {promptPreamble: string, promptSuffix: string, setupScript: string};
@@ -51,16 +51,16 @@ export class ControlTower {
 
     private watch(jobId: string): void {
         this.watchedJobs.set(jobId, '');
-        if (!this.watcherTimeout) {
-            this.watcherTimeout = setTimeout(() => this.fetchWatchedJobs(), 3 * 60 * 1000);
+        if (!this.watcherInterval) {
+            this.watcherInterval = setInterval(() => this.fetchWatchedJobs(), 3 * 60 * 1000);
         }
     }
 
     private unwatch(jobId: string): void {
         this.watchedJobs.delete(jobId);
-        if (this.watchedJobs.size === 0 && this.watcherTimeout) {
-            clearTimeout(this.watcherTimeout);
-            this.watcherTimeout = undefined;
+        if (this.watchedJobs.size === 0 && this.watcherInterval) {
+            clearTimeout(this.watcherInterval);
+            this.watcherInterval = undefined;
         }
     }
 
@@ -83,9 +83,9 @@ export class ControlTower {
             }
         }
         if (buffer.length) {
-            if (this.watchedJobs.size === 0 && this.watcherTimeout) {
-                clearTimeout(this.watcherTimeout);
-                this.watcherTimeout = undefined;
+            if (this.watchedJobs.size === 0 && this.watcherInterval) {
+                clearInterval(this.watcherInterval);
+                this.watcherInterval = undefined;
             }
 
             this.notify(`Updates about watched jobs:
