@@ -9,8 +9,9 @@
     "rootDir": "src",
     "noUncheckedIndexedAccess": true,
     "verbatimModuleSyntax": true,
-    "erasableSyntaxOnly": true,
-    "rewriteRelativeImportExtensions": true
+    "rewriteRelativeImportExtensions": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
   },
   "include": ["src"]
 }

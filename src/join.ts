@@ -6,6 +6,7 @@
 const ready = Symbol('ready');
 const take = Symbol('take');
 const evaluate = Symbol('evaluate');
+export const joinery = Symbol('joinery');
 
 export interface Mailbox<T> {
     (actual: T): void;

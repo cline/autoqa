@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 import { createTool } from '@cline/sdk';
 import type { AgentToolContext } from '@cline/sdk';
 

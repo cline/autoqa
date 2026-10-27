@@ -9,13 +9,14 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "node --watch-path=src --env-file=.env src/index.ts",
+    "dev": "tsc-watch --noClear --onSuccess \"node --enable-source-maps --inspect --env-file=.env dist/index.js\"",
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24",
+    "tsc-watch": "^7.2.1",
     "typescript": "^5.8"
   },
   "dependencies": {

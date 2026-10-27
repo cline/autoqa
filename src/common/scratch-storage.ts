@@ -3,7 +3,7 @@ import * as path from "node:path";
 
 export class ScratchStorage implements AsyncDisposable {
     private readonly parentPlusPrefix: string
-    private _root: fs.DisposableTempDir | undefined;
+    private _root: Promise<fs.DisposableTempDir> | undefined;
 
     constructor(parent: string, prefix: string) {
         this.parentPlusPrefix = path.resolve(path.join(parent, prefix));
@@ -11,9 +11,9 @@ export class ScratchStorage implements AsyncDisposable {
 
     public async root(): Promise<string> {
         if (!this._root) {
-            this._root = await fs.mkdtempDisposable(this.parentPlusPrefix)
+            this._root = fs.mkdtempDisposable(this.parentPlusPrefix);
         }
-        return this._root.path;
+        return (await this._root).path;
     }
 
     // Checks whether `s` is inside the root of this storage, and returns `s` as an absolute path.

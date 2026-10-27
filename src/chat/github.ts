@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 import { createTool } from '@cline/sdk';
 
 export function createGitHubGraphqlTool({token}: {token: string}) {

@@ -1,16 +1,13 @@
-import {App, type KnownEventFromType} from '@slack/bolt';
-import {WebClient, LogLevel} from '@slack/web-api';
+// Entrypoint for the AutoQA Slack app. Connects to Slack in sockets mode and runs a "first pass" agent to manage
+// spinning up AutoQA test instances.
 
-import {Chatter} from './slack/chat.ts';
-import {ScratchStorage} from "./common/scratch-storage.ts";
-import * as os from "node:os";
 import * as path from "node:path";
-
-const storage = new ScratchStorage(os.tmpdir(), `autoqa-${process.pid}-${Date.now()}`);
-
-const client = new WebClient(process.env.SLACK_BOT_TOKEN, {
-    logLevel: LogLevel.DEBUG
-});
+import {App} from '@slack/bolt'
+import {WebClient} from '@slack/web-api'
+import * as Sty from './slack-types.ts'
+import {SessionProxy, type Slacker} from "./slack/chat.ts";
+import * as os from "node:os";
+import {ScratchStorage} from "./common/scratch-storage.ts";
 
 const app = new App({
     token: process.env.SLACK_BOT_TOKEN,
@@ -18,162 +15,99 @@ const app = new App({
     socketMode: true,
 });
 
-// TODO: use 'hello' instead
-// https://docs.slack.dev/reference/events/hello
-const authResult = await app.client.auth.test({ token: process.env.SLACK_BOT_TOKEN });
-const myId = authResult.user_id;
+// Connects incoming Slack messages to AutoQA sessions handling them.
+class Switchboard {
+    // TODO: Shut down sessions if we have too many.
+    private readonly sessions = new Map<string, SessionProxy>();
 
-async function sleep(ms: number): Promise<void> {
-    return new Promise(resolve => {
-        console.log('starting sleep')
-        setTimeout(() => {
-            console.log(`slept for ${ms}`);
-            resolve();
-        }, ms)
-    });
+    async find(key: string, ifMissing: () => Promise<SessionProxy | undefined> | SessionProxy | undefined): Promise<SessionProxy | undefined> {
+        let session = this.sessions.get(key); // Do not use getOrInsertComputed here, we may not *want* to insert if missing.
+        if (!session) {
+            session = await ifMissing();
+            if (session) {
+                this.sessions.set(key, session);
+            }
+        }
+        return session;
+    }
 }
 
-const mentions = new Map<string,{ts: string, chatter: Chatter}>();
-
-// Computes a key for a thread we have been mentioned in.
-function key(event: {channel: string, ts: string, thread_ts?: string}): string {
+function keyOfSlackMessage(event: Sty.SlackMessage): string {
     return `${event.channel}-${event.thread_ts || event.ts}`;
 }
 
-function shuffled<T>(xs: T[]): T[] {
-    const array = [...xs];
-    for (let i = array.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [array[i], array[j]] = [array[j], array[i]];
+const storage = new ScratchStorage(os.tmpdir(), `autoqa-slack-${process.pid}`)
+const switchboard = new Switchboard();
+
+(app as any).event('message', async ({client, context, event, sayStream, setStatus}: {client: WebClient, context: Sty.SlackContext, event: Sty.SlackMessage, sayStream: Sty.SlackSayStream, setStatus: Sty.SlackSetStatus}) => {
+    if (event.user === context.botUserId || event.subtype === 'message_changed') {
+        return; // Ignore certain messages.
     }
-    return array;
-}
-
-const loadingText = [
-    'Rome wasn\'t built in a day.',
-    'Good things come to those who wait.',
-    'Patience is a virtue.',
-    'Coffee time? ☕',
-    'Remember to breathe.',
-    'Are you drinking enough water?',
-    'Start where you are.',
-    'Remember to get up and move around sometimes.',
-    'If birds can glide... why can\'t I?',
-    'I can hardly wait to get up in the morning.',
-    'Think in terms of energy, frequency and vibration.',
-    'Quality is job number one.',
-    'There is no "I" in "qualty assurance".',
-];
-
-for (const item of loadingText) {
-    console.assert(item.length < 51, `loading text "${item}" exceeds 51 character limit`);
-}
-
-// Gets whether AutoQA is being told to buzz off, meaning it should stop interacting on a
-// thread.
-function isBuzzOff(event: {text?: string}): boolean {
-    return event.text && event.text.indexOf(`<@${myId}> bye`) !== -1;
-}
-
-// Gets whether the specified user ID, for example U012AB3CD, is tagged in the message.
-function userIsTagged(event: KnownEventFromType<'message'>, userId: string): boolean {
-    if (!/^[A-Z0-9]+$/.test(userId)) {
-        throw new Error(`not a user ID: "${userId}"`);
-    }
-    const re = new RegExp(`\<@${userId}\>`)
-    return re.test(event.text);
-}
-
-app.event('message', async ({event, say, setStatus, client}) => {
-    // Skip our own messages.
-    //
-    // Unfortunately, Slack's types are complete garbage so this can't be typed without
-    // rewriting all of their types.
-    if (event.subtype === 'message_changed' && (event as any).message.user === myId) {
+    if (!event.text) {
+        console.log('lolwut is this message', JSON.stringify(event));
         return;
     }
 
-    console.log('message', JSON.stringify(event, null, 2));
+    const isMentioned = event.text.indexOf(`<@${context.botUserId}>`) !== -1;
+    const key = keyOfSlackMessage(event);
 
-    let context = mentions.get(key(event));
-    if (!context && userIsTagged(event, myId)) {
-        // This is a new tag for us.
-        console.log(`new tag in thread ${event.ts}`);
+    const session = await switchboard.find(key, isMentioned ? newSession : () => undefined);
+    if (session) {
+        session.onSlack(event);
+    }
 
-        // Spawn a worker to handle inference.
-        const slacker = {
-            say(markdown_text: string): void {
-                say({
-                    markdown_text,
+    async function newSession(): Promise<SessionProxy> {
+        const slacker: Slacker = {
+            sayStream,
+            setStatus,
+            async shareFile({filename}: {filename: string}): Promise<void> {
+                // TODO: Share success/failure of uploads back to the agent.
+                await client.filesUploadV2({
+                    file: filename,
+                    filename: path.basename(filename),
+                    channel_id: event.channel,
                     thread_ts: event.thread_ts || event.ts,
                 });
             },
-            setStatus(status: {text: string}) {
-                setStatus(status);
-            },
-            async uploadFile(filename: string): Promise<string> {
-                console.log(`checking ${filename} against storage root`)
-                const filePath = await storage.checked(filename);
-                console.log(`resolved filename to ${filePath}`);
-                // TODO: let the agent share Markdown, etc. files here with a channel.
-                let result
-                try {
-                    result = await client.filesUploadV2({
-                        file: filePath,
-                        filename: path.basename(filePath),
-                    });
-                } catch (error) {
-                    // TODO: hunt down and eliminate the sources of these errors.
-                    console.error(error, error.stack);
-                }
-                if (!result || !result.ok) {
-                    throw new Error(`File upload failed: ${JSON.stringify(result?.response_metadata)}`);
-                }
-                console.log(`sclerotic files API has result: ${JSON.stringify(result)}`);
-                return result;
-            },
         };
-        const chatter = new Chatter(key(event), slacker, await storage.root());
-
-        // Enter this mention into the mentions array.
-        context = {ts: event.thread_ts || event.ts, chatter};
-        mentions.set(key(event), context);
-
-        await setStatus({
-            status: 'active',
-            loading_messages: shuffled(loadingText).slice(0, 5),
-        });
+        return new SessionProxy(slacker, await storage.root());
     }
-    else if (!('thread_ts' in event))
-    {
-        console.log('not a threaded message');
-        return
-    }
-
-    console.log (`tagged in existing thread, ${event.text}`);
-
-    // Check if we're being told to buzz off.
-    if (isBuzzOff(event)) {
-        mentions.delete(key(event))
-        await setStatus({
-            status: ''
-        });
-        await client.reactions.add({
-            channel: event.channel,
-            timestamp: event.ts,
-            name: 'wave',
-        })
-        return;
-    }
-
-    if (!context) {
-        return;
-    }
-
-    context.chatter.onSlackMessage(event);
 });
+
+/* Example of Slack interactions that work:
+
+    await setStatus({
+        status: 'processing',
+        loading_messages: ['Uploading image...'],
+    });
+
+
+    await setStatus({
+        status: 'processing',
+        loading_messages: ['Streaming text...'],
+    });
+
+    const stream = sayStream();
+    await stream.append({markdown_text: 'Hello, world; '});
+    await stream.append({
+        chunks: [{
+            type: 'blocks',
+            blocks: [{
+                type: 'card',
+                title: {
+                    type: 'mrkdwn',
+                    text: 'Block Title',
+                },
+                body: {
+                    type: 'mrkdwn',
+                    text: 'Block body. Hello, world, <@U09GXRSE9DK> <@U09GXRSE9DK> <@U0CB0J2VC2X>',
+                },
+            }]
+        }]});
+    await stream.stop();
+ */
 
 (async () => {
     await app.start();
-    console.log('bolt app started');
+    console.log('autoqa-slack started');
 })();

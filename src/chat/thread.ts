@@ -1,19 +1,20 @@
 import {isMainThread, parentPort, threadId, workerData} from 'node:worker_threads';
+import * as path from 'node:path';
 
-import type {AgentRunResult} from "@cline/shared";
+import type {AgentRunResult} from "@cline/agents";
 
 import {QAAgent} from './agent.ts';
 import {Joinery} from '../join.ts';
 import type {KnownEventFromType} from "@slack/bolt";
+import type {GenericMessageEvent} from "@slack/web-api";
 import {ScratchStorage} from "../common/scratch-storage.ts";
-import type {UploadFileResult} from "../common/types.ts";
 
 if (isMainThread) {
     console.error('thread.ts running on main thread, exiting')
     process.exit(1);
 }
 
-const storage = new ScratchStorage(workerData.storageRoot, workerData.key);
+const storage = new ScratchStorage(workerData.storagePath, `worker-${workerData.key}`);
 
 class ChatterImpl {
     private readonly j = new Joinery();
@@ -24,7 +25,6 @@ class ChatterImpl {
     private readonly _pendingNotifications = this.j.m<string[]>();
     private readonly _noPendingNotifications = this.j.m<void>();
     private readonly _state = this.j.m<{messageCount: number}>();
-    private readonly uploadingFiles: Map<string,(value: UploadFileResult) => void> = new Map();
 
     constructor() {
         this.j.on([this._notify, this._noPendingNotifications], async (message) => {
@@ -77,16 +77,12 @@ class ChatterImpl {
             this.agentMessageToSlack(result);
         });
 
-        const uploadingFiles = this.uploadingFiles;
         const agent = new QAAgent(storage, this._notify, {
-            uploadFile(filename: string): Promise<UploadFileResult> {
+            uploadFile(filename: string): void {
                 console.log(`W->M upload-file ${filename}`);
                 parentPort.postMessage({
                     type: 'upload-file',
                     filename,
-                })
-                return new Promise((resolve) => {
-                    uploadingFiles.set(filename, resolve);
                 });
             }
         });
@@ -97,14 +93,9 @@ class ChatterImpl {
 
     get slack() { return this._slack; }
 
-    public uploadFileResult(value: UploadFileResult): void {
-        const f = this.uploadingFiles.get(value.filename);
-        console.log(f, JSON.stringify(value), JSON.stringify([...this.uploadingFiles.keys()]));
-        f(value);
-    }
-
     private slackToAgentMessageText(event: KnownEventFromType<'message'>): string {
-        return `${event.user} said:\n\n${event.text}`
+        const messageEvent = event as GenericMessageEvent;
+        return `${messageEvent.user} said:\n\n${messageEvent.text}`
     }
 
     private agentMessageToSlack(result: AgentRunResult): void {
@@ -141,8 +132,6 @@ parentPort.on('message', async (event) => {
     if ('type' in event) {
         if (event.type === 'slack') {
             chatter.slack(event.event);
-        } else if (event.type === 'upload-file-result') {
-            chatter.uploadFileResult(event.value);
         }
     }
 })

@@ -3,83 +3,95 @@
 import {extname} from 'node:path';
 import {fileURLToPath} from "node:url";
 import {Worker} from "node:worker_threads";
-import type {UploadFileResult} from "../common/types.ts";
+import * as Sty from "../slack-types.ts";
+import {Joinery} from "../join.ts";
 
-interface Slacker {
-    say(msg: string): void;
-    setStatus(status: {text: string}): void;
-
-    // Uploads the specified file and returns the Slack ID of the resource.
-    uploadFile(fileName: string): Promise<string>;
+export interface Slacker {
+    sayStream: Sty.SlackSayStream;
+    setStatus: Sty.SlackSetStatus;
+    shareFile(options: {filename: string}): void;
 }
 
-export class Chatter {
-    private readonly slacker: Slacker;
-    private readonly worker: Worker;
+export class SessionProxy {
+    public readonly onSlack: (event: Sty.SlackMessage) => void;
 
-    constructor(key: string, slacker: Slacker, storageRoot: string) {
-        this.slacker = slacker;
-        this.worker = spawnChatWorker({key, storageRoot: storageRoot});
+    constructor(slacker: Slacker, storagePath: string,) {
+        const j = new Joinery();
 
-        this.worker.on('message', (msg) => {
-            if ('watch:require' in msg || 'watch:import' in msg) {
+        const onSlack = j.m<Sty.SlackMessage>();
+
+        const legacySay = j.m<string>();
+        const legacyStatus = j.m<string>();
+        const legacyFileUpload = j.m<string>();
+
+        const state = j.m<{worker: Worker, slacker: Slacker}>();
+
+        j.on([state, legacySay], async (s, text) => {
+            const stream = s.slacker.sayStream();
+            await stream.append({markdown_text: text});
+            await stream.stop();
+            state(s);
+        });
+
+        j.on([state, legacyStatus], (s, status) => {
+            state(s);
+            void s.slacker.setStatus({
+                status,
+            });
+        });
+
+        j.on([state, legacyFileUpload], (s, filename) => {
+            try {
+                s.slacker.shareFile({filename});
+            } catch (error) {
+                // TODO: Report errors to the agent.
+                console.error(`Error sharing file: ${error}\n${error.stack}`);
+            }
+            state(s);
+        });
+
+        j.on([state, onSlack], (s, event) => {
+            s.worker.postMessage({
+                type: 'slack',
+                event,
+            });
+            state(s);
+        });
+
+        this.onSlack = onSlack;
+        state({worker: this.spawnChatWorker(storagePath, legacySay, legacyStatus, legacyFileUpload), slacker});
+    }
+
+    spawnChatWorker(storagePath: string, legacySay, legacyStatus, legacyFileUpload): Worker {
+        const ext = extname(fileURLToPath(import.meta.url));
+        const THREAD_ENTRY = new URL(`../chat/thread${ext}`, import.meta.url);
+        const worker = new Worker(THREAD_ENTRY, {
+            workerData: {
+                storagePath,
+                key: 'deprecated-remove-workerData-key',
+            },
+            resourceLimits: {
+                maxOldGenerationSizeMb: 200,
+            }
+        });
+
+        // Parse and dispatch events.
+        worker.on('message', (event: any) => {
+            // Filter node events of no relevance to us.
+            if ('watch:require' in event || 'watch:import' in event) {
                 return;
             }
-            this.fromWorker(msg)
-        })
-    }
 
-    onSlackMessage(event: any) {
-        this.worker.postMessage({
-            type: 'slack',
-            event,
-        })
-    }
+            // Legacy events.
+            if (event.type === 'say') {
+                legacySay(event.text);
+            } else if (event.type === 'setStatus') {
+                legacyStatus(event.status);
+            } else if (event.type === 'upload-file') {
+                legacyFileUpload(event.filename);
+            }
+        });
 
-    private fromWorker(event: any) {
-        if (event.type === 'say') {
-            this.slacker.say(event.text);
-        } else if (event.type === 'setStatus') {
-            console.log('set status (worker)');
-            this.slacker.setStatus(event.status);
-        } else if (event.type === 'upload-file') {
-            console.log(`file upload, ${JSON.stringify(event)}`);
-            const { filename } = event;
-            // TODO: Switch to a joinery when we have a shutdown protocol here.
-            void (async () => {
-                try {
-                    const result = await this.slacker.uploadFile(filename);
-                    this.worker.postMessage({
-                        type: 'upload-file-result',
-                        value: {
-                            type: 'success',
-                            filename,
-                            result,
-                        } satisfies UploadFileResult,
-                    });
-                } catch (error) {
-                    console.error(error, error.stack);
-                    this.worker.postMessage({
-                        type: 'upload-file-result',
-                        value: {
-                            type: 'failure',
-                            filename,
-                            error: `${error}`,
-                        } satisfies UploadFileResult,
-                    });
-                }
-            })()
-        }
+        return worker;
     }
-}
-
-function spawnChatWorker(workerData: any): Worker {
-    const ext = extname(fileURLToPath(import.meta.url));
-    const THREAD_ENTRY = new URL(`../chat/thread${ext}`, import.meta.url);
-    return new Worker(THREAD_ENTRY, {
-        workerData,
-        resourceLimits: {
-            maxOldGenerationSizeMb: 200,
-        }
-    });
 }

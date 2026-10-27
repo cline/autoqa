@@ -1,10 +1,1 @@
-export type UploadFileResult = {
-    type: 'success',
-    filename: string,
-    result: any,
-} | {
-    type: 'failure',
-    filename: string,
-    error: string,
-};
-
+// TODO: shared types between main and worker threads go here

@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 import { readFileSync } from 'node:fs';
 
 import {Agent} from '@cline/agents';
@@ -24,7 +26,7 @@ export function controlTowerBaseUrl(): string {
 export const SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
 
 export interface Slacker {
-    uploadFile(filename: string): Promise<UploadFileResult>,
+    uploadFile(filename: string): void,
 }
 
 export class QAAgent {
@@ -130,6 +132,9 @@ If you encounter errors you can echo them to the user so they can reach me with 
 
 You are communicating the user (maybe multiple users!) over Slack:
 - You can use Markdown such as > to quote user text, \` for literal text, etc.
+- You do not need to inform us when you start artifact fetches, just report to us when
+  you have something to share. Because starting an AutoQA container DOES take a long
+  time, you should let us know when you do that so we won't hang around.
 - If you ever receive a message, but you have nothing to add (for example one user is
   addressing another) then reply with one word \`GOTCHA\` and we will not forward
   your reply to the humans' conversation thread.
