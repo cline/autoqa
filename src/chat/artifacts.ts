@@ -1,5 +1,3 @@
-// @ts-nocheck
-
 import { createWriteStream} from "node:fs";
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';

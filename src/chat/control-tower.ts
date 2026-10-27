@@ -1,5 +1,3 @@
-// @ts-nocheck
-
 import { createTool } from '@cline/sdk';
 import type { AgentToolContext } from '@cline/sdk';
 
@@ -35,88 +33,183 @@ interface Job {
 }
 interface JobList { jobs: Job[] }
 
-export function createControlTowerTools(options: ControlTowerOptions = {}) {
-    const tower = createClient(options);
-    const source = options.source ?? 'autoqa';
+export class ControlTower {
+    private readonly watchedJobs = new Map<string, string>()
+    private watcherTimeout: NodeJS.Timeout | undefined
+    private readonly client: ReturnType<typeof createClient>;
+    // TODO: These should vary by job type, but we only have one job type!
+    private readonly configurationOptions: {promptPreamble: string, promptSuffix: string, setupScript: string};
 
-    async function find(ref: string, signal?: AbortSignal): Promise<Job> {
-        const key = ref.trim().toLowerCase();
-        const job = (await tower.list(signal)).jobs.find((j) => j.submission.id === key || j.name === key);
-        if (!job) throw new Error(`No job ${ref}. It may have been deleted or aged out of history.`);
-        return job;
+    constructor(private readonly notify: (message: string) => void, options: ControlTowerOptions = {}) {
+        this.client = createClient(options);
+        this.configurationOptions = {
+            promptPreamble: options.promptPreamble,
+            promptSuffix: options.promptSuffix,
+            setupScript: options.setupScript,
+        };
     }
 
-    const submit = createTool<{ title: string; task: string }, string>({
-        name: 'submit_qa_job',
-        description:
-            'Start a QA run on a fresh Windows VM. Returns at once with the job ID; the run takes ' +
-            'minutes to hours. Check on it later with list_qa_jobs.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                title: { type: 'string', description: 'Short human-readable name, at most 512 bytes.' },
-                task: { type: 'string', description: 'What the worker should test, in plain language.' },
-            },
-            required: ['title', 'task'],
-            additionalProperties: false,
-        },
-        async execute(input: { title: string; task: string }, context: AgentToolContext) {
-            const job = await tower.submit(
-                {
-                    id: crypto.randomUUID(),
-                    worker_profile: options.workerProfile ?? 'windows',
-                    title: input.title,
-                    source,
-                    prompt: [options.promptPreamble, input.task, options.promptSuffix].filter(Boolean).join('\n\n'),
-                    setup_script: options.setupScript ?? '',
-                },
-                context.signal,
-            );
-            return render(describe(job));
-        },
-    });
+    private watch(jobId: string): void {
+        this.watchedJobs.set(jobId, '');
+        if (!this.watcherTimeout) {
+            this.watcherTimeout = setTimeout(() => this.fetchWatchedJobs(), 3 * 60 * 1000);
+        }
+    }
 
-    const list = createTool<{ id?: string; include_finished?: boolean }, string>({
-        name: 'list_qa_jobs',
-        description:
-            'Show QA jobs: one job when id is given, otherwise every active job and, if ' +
-            'include_finished is true, the 20 most recent finished ones.',
-        inputSchema: {
-            type: 'object',
-            properties: {
-                id: { type: 'string', description: 'Job ID or VM name (ct-...).' },
-                include_finished: { type: 'boolean' },
-            },
-            additionalProperties: false,
-        },
-        async execute(input: { id?: string; include_finished?: boolean }, context: AgentToolContext) {
-            if (input.id) return render(describe(await find(input.id, context.signal)));
-            const jobs = (await tower.list(context.signal)).jobs.sort((a, b) => b.created_at - a.created_at);
-            const active = jobs.filter((j) => j.phase.kind !== 'finished');
-            const finished = input.include_finished ? jobs.filter((j) => j.phase.kind === 'finished').slice(0, 20) : [];
-            return render([...active, ...finished].map(describe));
-        },
-    });
+    private unwatch(jobId: string): void {
+        this.watchedJobs.delete(jobId);
+        if (this.watchedJobs.size === 0 && this.watcherTimeout) {
+            clearTimeout(this.watcherTimeout);
+            this.watcherTimeout = undefined;
+        }
+    }
 
-    const cancel = createTool<{ id: string }, string>({
-        name: 'cancel_qa_job',
-        description: `Cancel a QA job this bot submitted and delete its VM. Jobs from other sources are refused.`,
-        inputSchema: {
-            type: 'object',
-            properties: { id: { type: 'string', description: 'Job ID or VM name (ct-...).' } },
-            required: ['id'],
-            additionalProperties: false,
-        },
-        async execute(input: { id: string }, context: AgentToolContext) {
-            const job = await find(input.id, context.signal);
-            if (job.submission.source !== source) {
-                throw new Error(`Job ${job.submission.id} was submitted by "${job.submission.source}", not ${source}.`);
+    private async fetchWatchedJobs(): Promise<void> {
+        const statuses = await this.client.list();
+        const buffer = [];
+        for (const [watchedJobId, oldStatus] of this.watchedJobs.entries()) {
+            const job = statuses.jobs.find(job => job.submission.id === watchedJobId);
+            if (!job) {
+                buffer.push(`${watchedJobId} was not found; we will stop watching this job. Re-list/watch if necessary.`);
+                this.watchedJobs.delete(watchedJobId);
+                continue;
             }
-            return render(describe(await tower.cancel(job.submission.id, context.signal)));
-        },
-    });
+            const stringified = JSON.stringify(job);
+            if (stringified !== oldStatus) {
+                // Note! If this loop becomes async, you must retest watchedJobs.has(watchedJobId) here.
+                // Otherwise this update will re-register the watch.
+                this.watchedJobs.set(watchedJobId, stringified);
+                buffer.push(`${watchedJobId} has changed status: ${stringified}`);
+            }
+        }
+        if (buffer.length) {
+            if (this.watchedJobs.size === 0 && this.watcherTimeout) {
+                clearTimeout(this.watcherTimeout);
+                this.watcherTimeout = undefined;
+            }
 
-    return [submit, list, cancel];
+            this.notify(`Updates about watched jobs:
+${buffer.join('\n')}`);
+        }
+    }
+
+    public createTools() {
+        // TODO: Consider naming the requesting user is the source.
+        const source = 'autoqa';
+        const client = this.client;
+        const { promptPreamble, promptSuffix, setupScript } = this.configurationOptions;
+
+        async function find(ref: string, signal?: AbortSignal): Promise<Job> {
+            const key = ref.trim().toLowerCase();
+            const job = (await client.list(signal)).jobs.find((j) => j.submission.id === key || j.name === key);
+            if (!job) throw new Error(`No job ${ref}. It may have been deleted or aged out of history.`);
+            return job;
+        }
+
+        const submit = createTool<{ title: string; task: string }, string>({
+            name: 'submit_qa_job',
+            description:
+                'Start a QA run on a fresh VM. Returns at once with the job ID; the run takes ' +
+                'minutes to hours. Check on it later with list_qa_jobs.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    title: {type: 'string', description: 'Short human-readable name, at most 512 bytes.'},
+                    task: {type: 'string', description: 'What the worker should test, in plain language.'},
+                },
+                required: ['title', 'task'],
+                additionalProperties: false,
+            },
+            async execute(input: { title: string; task: string }, context: AgentToolContext) {
+                const job = await client.submit(
+                    {
+                        id: crypto.randomUUID(),
+                        // TODO: add the worker profile to the tool options
+                        worker_profile: 'windows',
+                        title: input.title,
+                        source,
+                        prompt: [promptPreamble, input.task, promptSuffix].filter(Boolean).join('\n\n'),
+                        setup_script: setupScript ?? '',
+                    },
+                    context.signal,
+                );
+                return render(describe(job));
+            },
+        });
+
+        const list = createTool<{ id?: string; include_finished?: boolean }, string>({
+            name: 'list_qa_jobs',
+            description:
+                'Show QA jobs: one job when id is given, otherwise every active job and, if ' +
+                'include_finished is true, the 20 most recent finished ones.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    id: {type: 'string', description: 'Job ID or VM name (ct-...).'},
+                    include_finished: {type: 'boolean'},
+                },
+                additionalProperties: false,
+            },
+            async execute(input: { id?: string; include_finished?: boolean }, context: AgentToolContext) {
+                if (input.id) return render(describe(await find(input.id, context.signal)));
+                const jobs = (await client.list(context.signal)).jobs.sort((a, b) => b.created_at - a.created_at);
+                const active = jobs.filter((j) => j.phase.kind !== 'finished');
+                const finished = input.include_finished ? jobs.filter((j) => j.phase.kind === 'finished').slice(0, 20) : [];
+                return render([...active, ...finished].map(describe));
+            },
+        });
+
+        const cancel = createTool<{ id: string }, string>({
+            name: 'cancel_qa_job',
+            description: `Cancel a QA job this bot submitted and delete its VM. Jobs from other sources are refused.`,
+            inputSchema: {
+                type: 'object',
+                properties: {id: {type: 'string', description: 'Job ID or VM name (ct-...).'}},
+                required: ['id'],
+                additionalProperties: false,
+            },
+            async execute(input: { id: string }, context: AgentToolContext) {
+                const job = await find(input.id, context.signal);
+                if (job.submission.source !== source) {
+                    throw new Error(`Job ${job.submission.id} was submitted by "${job.submission.source}", not ${source}.`);
+                }
+                return render(describe(await client.cancel(job.submission.id, context.signal)));
+            },
+        });
+
+        const self = this;
+        const watch = createTool<{ id: string }, string>({
+            name: 'watch_qa_job',
+            description: `Watch a QA job for updates. You will get updates in messages.`,
+            inputSchema: {
+                type: 'object',
+                properties: {id: {type: 'string', description: 'Job ID to watch.'}},
+                required: ['id'],
+                additionalProperties: false,
+            },
+            async execute(input: { id: string }, context: AgentToolContext) {
+                self.watch(input.id);
+                return `Started watching job "${input.id}".`;
+            },
+        });
+
+        const unwatch = createTool<{ id: string }, string>({
+            name: 'unwatch_qa_job',
+            description: `Stop watching a QA job for updates. You may get one final update.`,
+            inputSchema: {
+                type: 'object',
+                properties: {id: {type: 'string', description: 'Job ID to stop watching.'}},
+                required: ['id'],
+                additionalProperties: false,
+            },
+            async execute(input: { id: string }, context: AgentToolContext) {
+                self.unwatch(input.id);
+                return `Stopped watching job "${input.id}".`;
+            },
+        });
+
+        return [submit, list, cancel, watch, unwatch];
+    }
 }
 
 function describe(job: Job) {

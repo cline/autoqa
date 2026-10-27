@@ -1,15 +1,14 @@
-// @ts-nocheck
-
+import * as fs from "node:fs/promises"
 import { readFileSync } from 'node:fs';
+import * as path from "node:path"
 
 import {Agent} from '@cline/agents';
-import { ProviderSettingsManager, resolveProviderApiKeyFromSettings } from "@cline/core";
+import {createDefaultExecutors, createDefaultTools, ProviderSettingsManager, type ToolExecutors, resolveProviderApiKeyFromSettings } from "@cline/core";
 
-import {createControlTowerTools} from './control-tower.ts';
+import {ControlTower} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
 import type {ScratchStorage} from "../common/scratch-storage.ts";
 import {Curator} from "./artifacts.ts";
-import type {UploadFileResult} from "../common/types.ts";
 
 function readWindowsAsset(name: string): string {
     // assets/ sits two levels above this file, both in src/worker/ and in dist/worker/.
@@ -29,6 +28,37 @@ export interface Slacker {
     uploadFile(filename: string): void,
 }
 
+type FileReadExecutor = NonNullable<ToolExecutors["readFile"]>
+
+export function createRootedReadExecutor(
+    root: string,
+): FileReadExecutor {
+    const readFile = createDefaultExecutors({ fileRead: { maxFileSizeBytes: 500_000 } }).readFile
+    if (!readFile) {
+        throw new Error("SDK default executors did not provide a readFile executor")
+    }
+    const rootRealPath = fs.realpath(root)
+
+    return async (request, context) => {
+        // The SDK spills large tool results to cline:// URIs and tells the model to read them back.
+        if (request.path.startsWith("cline://")) {
+            return readFile(request, context)
+        }
+        // Relative paths resolve against root; absolute paths stay absolute.
+        // realpath stops symlinks inside root from pointing outside it.
+        const realPath = await fs.realpath(path.resolve(root, request.path))
+        const relativePath = path.relative(await rootRealPath, realPath)
+        const outsideRoot =
+            relativePath === ".." ||
+            relativePath.startsWith(`..${path.sep}`) ||
+            path.isAbsolute(relativePath) // different drive on Windows
+        if (outsideRoot) {
+            throw new Error(`Access denied: ${request.path}`)
+        }
+        return readFile({ ...request, path: realPath }, context)
+    }
+}
+
 export class QAAgent {
     private readonly storage: ScratchStorage;
     private readonly slacker: Slacker;
@@ -45,6 +75,23 @@ export class QAAgent {
         const providerSettingsManager = new ProviderSettingsManager();
         const apiKey = resolveProviderApiKeyFromSettings(providerSettingsManager, "cline");
         const curator = new Curator(this.storage, this.notify, this.slacker);
+        const controlTower = new ControlTower(this.notify, {
+            baseUrl: controlTowerBaseUrl(),     // tunnel now, co-located later; same URL either way
+            promptPreamble: '',
+            setupScript: SETUP_SCRIPT,          // optional
+        });
+
+        const defaultTools = createDefaultTools({
+            executors: {
+                readFile: createRootedReadExecutor(await this.storage.root()),
+            },
+            fileReadTimeoutMs: 10_000, // optional; this is the default
+        });
+        if (defaultTools.length !== 1) {
+            console.error(`${defaultTools.length} default tools`);
+            throw new Error('too many/few default tools; only wanted a read_file tool');
+        }
+
         this.agent = new Agent({
             providerId: 'cline',
             apiKey: apiKey || process.env.CLINE_API_KEY,
@@ -63,7 +110,7 @@ There are some limitations on WHAT we can test right now:
 - You, AutoQA bot, are in DEVELOPMENT MODE and as such you may completely lose context when
   your server is restarted. If you don't know what the user is talking about, politely explain
   you probably restarted, ask them for a Job ID, and pick up from there.
-- Spinning up instances takes a few minutes.
+- Spinning up instances takes a several minutes.
 - There's no realtime screen sharing or direct clicking or typing by YOU or the Cline team
   member. You hand the tasks off to the computer use agent, can do some minimal monitoring
   of what's going on, and collect and present the results.
@@ -78,9 +125,11 @@ There are some limitations on WHAT we can test right now:
   plugin from our public releases. It just can't build it itself or see all the source code.)
 - Access to the Cline API is restricted in the container. Specifically, the computer use agent
   can't create/read/manage cloud sessions, and it doesn't have a username and password so it
-  can't log in to https://app.cline.bot. It can't create new API keys. (It *is* logged in to
-  Cline and has an existing API key, though, that it can use for lots of tasks including
-  inference with tons of different models.)
+  can't log in to the website, https://app.cline.bot. It can't create new API keys. But it IS
+  logged in to Cline and has an existing API key, which it should copy to the
+  .cline/data/settings/providers.json of the Cline under test. That key is "leak proof" and
+  only works in the computer use agent's container. You should explicitly encourage it to reuse
+  that key and it does not need to be handled with care.
 
 If the user asks you to test something you _know_ won't work, please briefly explain the
 situation. If you're unsure, it is okay to explain caveats to the user but go ahead and try
@@ -186,13 +235,9 @@ Put the answer where the reader can find it fast. Write plainly and directly.
             `,
             maxIterations: 10,
             tools: [
+                ...defaultTools,
                 createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN}),
-                ...createControlTowerTools({
-                    baseUrl: controlTowerBaseUrl(),     // tunnel now, co-located later; same URL either way
-                    promptPreamble: '',
-                    setupScript: SETUP_SCRIPT,          // optional
-                    source: 'autoqa',
-                }),
+                ...controlTower.createTools(),
                 ...curator.createTools(),
             ],
         });
@@ -205,8 +250,6 @@ Put the answer where the reader can find it fast. Write plainly and directly.
         return await this.agent.run(message);
     }
 }
-
-// TODO: async updates from the container
 
 // TODO: whiteboard
 //

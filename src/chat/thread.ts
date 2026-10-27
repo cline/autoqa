@@ -1,5 +1,4 @@
 import {isMainThread, parentPort, threadId, workerData} from 'node:worker_threads';
-import * as path from 'node:path';
 
 import type {AgentRunResult} from "@cline/agents";
 
