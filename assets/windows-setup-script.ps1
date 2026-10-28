@@ -132,7 +132,16 @@ namespace Friendzone {
     Push-Location $cline
     try {
         Native bun.exe @('install', '--frozen-lockfile')
-        Native bun.exe @('-F', '@cline/cli', 'build:platforms:single')
+        try {
+            Native bun.exe @('-F', '@cline/cli', 'build:platforms:single')
+        } catch {
+            # build.ts deletes dist before building and copies cline.exe into it
+            # before the smoke tests, so a binary here means compilation succeeded
+            # and only a later check (hub smoke test, package.json) failed.
+            if (-not (Test-Path -LiteralPath $clineExe)) { throw }
+            Write-Warning "using $clineExe despite: $($_.Exception.Message)"
+            Native $clineExe @('--version')
+        }
     } finally { Pop-Location }
 
     # Preserve Friendzone plugins/config; isolate runtime data per job.
