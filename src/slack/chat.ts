@@ -2,7 +2,10 @@
 
 import {extname} from 'node:path';
 import {fileURLToPath} from "node:url";
+import {type DisposableTempDir, mkdtempDisposable} from "node:fs/promises";
+import * as path from "node:path";
 import {Worker} from "node:worker_threads";
+
 import * as Sty from "../slack-types.ts";
 import {Joinery} from "../join.ts";
 
@@ -15,6 +18,7 @@ export interface Slacker {
 
 export class SessionProxy {
     public readonly onSlack: (event: Sty.SlackMessage) => void;
+    public readonly terminate: () => void;
 
     constructor(slacker: Slacker, storagePath: string,) {
         const j = new Joinery();
@@ -24,8 +28,18 @@ export class SessionProxy {
         const legacySay = j.m<string>();
         const legacyStatus = j.m<string>();
         const legacyFileUpload = j.m<string>();
+        const terminate = j.m<void>();
+        const state = j.m<{worker: Worker, slacker: Slacker, storageDisposable: DisposableTempDir}>();
 
-        const state = j.m<{worker: Worker, slacker: Slacker}>();
+        j.on([state, terminate], async ({worker, storageDisposable}) => {
+            // TODO: This does not clean up the worker's storage.
+            console.log('starting to terminate worker');
+            await worker.terminate();
+            console.log('deleting temporary storage');
+            await storageDisposable[Symbol.asyncDispose]();
+            console.log('termination done');
+            // Do not re-produce state, effectively halting any more dispatch. (But it will buffer incoming messages.)
+        });
 
         j.on([state, legacySay], async (s, text) => {
             const stream = s.slacker.sayStream();
@@ -36,9 +50,7 @@ export class SessionProxy {
 
         j.on([state, legacyStatus], (s, status) => {
             state(s);
-            void s.slacker.setStatus({
-                status,
-            });
+            void s.slacker.setStatus(status);
         });
 
         j.on([state, legacyFileUpload], (s, filename) => {
@@ -60,16 +72,20 @@ export class SessionProxy {
         });
 
         this.onSlack = onSlack;
-        state({worker: this.spawnChatWorker(storagePath, slacker.botUserId, legacySay, legacyStatus, legacyFileUpload), slacker});
+        this.terminate = terminate;
+        void (async () => {
+            state({...await this.spawnChatWorker(storagePath, slacker.botUserId, legacySay, legacyStatus, legacyFileUpload), slacker});
+        })();
     }
 
-    spawnChatWorker(storagePath: string, botUserId: string, legacySay, legacyStatus, legacyFileUpload): Worker {
+    private async spawnChatWorker(storagePath: string, botUserId: string, legacySay, legacyStatus, legacyFileUpload): Promise<{worker: Worker, storageDisposable: DisposableTempDir}> {
+        const storagePathDisposable = await mkdtempDisposable(path.join(storagePath, 'worker'))
+
         const ext = extname(fileURLToPath(import.meta.url));
         const THREAD_ENTRY = new URL(`../chat/thread${ext}`, import.meta.url);
         const worker = new Worker(THREAD_ENTRY, {
             workerData: {
-                storagePath,
-                key: 'deprecated-remove-workerData-key',
+                storagePath: storagePathDisposable.path,
                 botUserId,
             },
             resourceLimits: {
@@ -94,6 +110,6 @@ export class SessionProxy {
             }
         });
 
-        return worker;
+        return {worker, storageDisposable: storagePathDisposable};
     }
 }

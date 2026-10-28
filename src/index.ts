@@ -30,6 +30,17 @@ class Switchboard {
         }
         return session;
     }
+
+    terminate(key: string) {
+        console.log(`terminating session ${key}`);
+        const session = this.sessions.get(key);
+        if (!session) {
+            console.log(`no session found trying to terminate ${key}`)
+            return;
+        }
+        this.sessions.delete(key);
+        session.terminate();
+    }
 }
 
 function keyOfSlackMessage(event: Sty.SlackMessage): string {
@@ -44,19 +55,33 @@ const switchboard = new Switchboard();
         return; // Ignore certain messages.
     }
     if (!event.text) {
-        console.log('lolwut is this message', JSON.stringify(event));
+        console.log('skipping message without text:', JSON.stringify(event));
         return;
     }
 
     const isMentioned = event.text.indexOf(`<@${context.botUserId}>`) !== -1;
+    const isBuzzOff = event.text.indexOf(`<@${context.botUserId}> bye`) !== -1;
     const key = keyOfSlackMessage(event);
+
+    if (isBuzzOff) {
+        switchboard.terminate(key);
+        await client.reactions.add({
+            channel: event.channel,
+            timestamp: event.ts,
+            name: 'wave',
+        });
+        return
+    }
 
     const session = await switchboard.find(key, isMentioned ? newSession : () => undefined);
     if (session) {
         session.onSlack(event);
+    } else {
+        console.log(`ignoring message (${event.type}) - not mentioned, no existing thread`)
     }
 
     async function newSession(): Promise<SessionProxy> {
+        console.log(`creating new session for ${key}`);
         const slacker: Slacker = {
             sayStream,
             setStatus,

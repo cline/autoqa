@@ -4,7 +4,7 @@ import type {AgentRunResult} from "@cline/agents";
 
 import {QAAgent} from './agent.ts';
 import {Joinery} from '../join.ts';
-import type {KnownEventFromType} from "@slack/bolt";
+import type {KnownEventFromType, SetStatusFn} from "@slack/bolt";
 import type {GenericMessageEvent} from "@slack/web-api";
 import {ScratchStorage} from "../common/scratch-storage.ts";
 
@@ -13,7 +13,8 @@ if (isMainThread) {
     process.exit(1);
 }
 
-const storage = new ScratchStorage(workerData.storagePath, `worker-${workerData.key}`);
+// TODO: The main thread is now managing storage, so we could remove this.
+const storage = new ScratchStorage(workerData.storagePath, 'worker');
 
 class ChatterImpl {
     private readonly j = new Joinery();
@@ -45,22 +46,8 @@ class ChatterImpl {
         // TODO: This serializes user messages, we can buffer instead.
         this.j.on([this._slack, this._agentIdle, this._state], async (event, agent, {messageCount}) => {
             console.log('slack+agent-idle');
+            this.setStatus('processing');
             this._state({messageCount: messageCount + 1});
-
-            // Remind the user how to make us go away, sometimes.
-            if ([1, 2].indexOf(messageCount % 5) !== -1) {
-                parentPort.postMessage({
-                    type: 'setStatus',
-                    status: {
-                        status: 'processing',
-                        loading_messages: [
-                            messageCount % 5 === 1 ?
-                                'Tip: Use @AutoQA bye, and I\'ll butt out. 👋'
-                                : 'Tip: Mention @AutoQA any time and I\'ll pop in.'
-                        ]
-                    }
-                });
-            }
 
             // Send the message to the agent.
             this._agentDone({
@@ -71,6 +58,7 @@ class ChatterImpl {
 
         this.j.on([this._agentDone], ({agent, result}) => {
             console.log('agent-done')
+            this.setStatus('');
             this._agentIdle(agent);
             console.log(`worker ${threadId}: ${JSON.stringify(result, null, 2)}`);
             this.agentMessageToSlack(result);
@@ -92,6 +80,13 @@ class ChatterImpl {
     }
 
     get slack() { return this._slack; }
+
+    private setStatus(status: Parameters<SetStatusFn>[0]): void {
+        parentPort.postMessage({
+            type: 'setStatus',
+            status,
+        });
+    }
 
     private slackToAgentMessageText(event: KnownEventFromType<'message'>): string {
         const messageEvent = event as GenericMessageEvent;
