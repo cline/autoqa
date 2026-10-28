@@ -183,7 +183,7 @@ details.
 
 DO encourage the CUA to install VSCode if it needs to.
 
-DO instruct the CUA to copy its Cline inference key from $Env:CLINE_DATA/data/settings/providers.json
+DO instruct the CUA to copy its Cline inference key from $Env:CLINE_DIR/data/settings/providers.json
 and reuse it in the system under test. DO instruct it that the key is "leak proof" and does not
 need to be handled with any care.
 
