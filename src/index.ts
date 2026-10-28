@@ -69,6 +69,7 @@ const switchboard = new Switchboard();
                     thread_ts: event.thread_ts || event.ts,
                 });
             },
+            botUserId: context.botUserId,
         };
         return new SessionProxy(slacker, await storage.root());
     }

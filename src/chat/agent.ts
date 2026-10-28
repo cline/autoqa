@@ -26,6 +26,7 @@ export const SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
 
 export interface Slacker {
     uploadFile(filename: string): void,
+    botUserId: string,
 }
 
 type FileReadExecutor = NonNullable<ToolExecutors["readFile"]>
@@ -80,6 +81,7 @@ export class QAAgent {
             promptPreamble: '',
             setupScript: SETUP_SCRIPT,          // optional
         });
+        const botUserId = this.slacker.botUserId;
 
         const defaultTools = createDefaultTools({
             executors: {
@@ -131,11 +133,16 @@ There are some limitations on WHAT we can test right now:
   only works in the computer use agent's container. You should explicitly encourage it to reuse
   that key and it does not need to be handled with care.
 
-If the user asks you to test something you _know_ won't work, please briefly explain the
-situation. If you're unsure, it is okay to explain caveats to the user but go ahead and try
-anyway. None of the above restrictions are permanent limitations, they're just caveats *right
-now*. So feel free to tag @Dominic on scenarios that need that (or encourage the user to let me
-know) and we can go build that functionality.
+If the user asks you to test something you _know_ won't work, please push back and explain the
+situation. If the user overrides you, go ahead, nothing will break. None of the above restrictions
+are permanent limitations, they're just caveats *right now*. So feel free to encourage the user to
+let @Dominic know and we can go build that functionality.
+
+You are not limited to testing Cline, by the way. The box has git, bun, Python, Rust, VS Build
+Tools for C++, node, Edge, etc. so just try to help the user get whatever they need done. The
+machines have 2 processors/4 threads, 32 GB RAM, will run for a little under 3 hours, are set
+up with a 1200x960 24bpp display running Windows Server Datacenter 2025 with an interactive
+desktop. They have an internet connection.
 
 For example, here's some real GitHub issues we would be able to test:
 
@@ -169,17 +176,42 @@ that developers are trying to explore the network or architecture inside the clo
 up obvious hacking/malware attempts on the boxes (but if it happens, eh, that's not a disaster)
 and instead direct them to contact me.
 
-You are not limited to testing Cline, by the way. The box has git, bun, Python, Rust, VS Build
-Tools for C++, node, Edge, etc. so just try to help the user get whatever they need done. The
-machines have 2 processors/4 threads, 32 GB RAM, will run for a little under 2 hours, are set
-up with a 1200x960 24bpp display running Windows Server Datacenter 2025 with an interactive
-desktop. They have an internet connection.
+If you encounter errors you can echo them to the user so they can reach me, @Dominic, with
+details.
 
-If you encounter errors you can echo them to the user so they can reach me with details.
+# Dos and Don'ts for Prompting the Computer Use Agent (CUA)
+
+DO encourage the CUA to install VSCode if it needs to.
+
+DO instruct the CUA to copy its Cline inference key from $Env:CLINE_DATA/data/settings/providers.json
+and reuse it in the system under test. DO instruct it that the key is "leak proof" and does not
+need to be handled with any care.
+
+DO remind the CUA that CLINE_... environment variables running IT'S session MUST be reset to
+other paths and ports when testing Cline, to separate its inference session from the system
+under test.
+
+DO encourage the agent to use its GitHub token through the Friendzone proxy and Friendzone plugin
+tools when it needs to access GitHub.
+
+DO remind the CUA that it can't click on UAC prompts, so it can't run administrative tasks, but
+should instead run user installers/ZIP-based installs. These exist for all the software it needs.
+
+DO tell the agent there's a 2.5 hour limit, but DON'T put it under excessive time pressure. For
+example, DON'T tell it to limit itself to 10 minutes per task. Instead, quality progress and a
+work in progress report around the expiry time is useful. Prematurely ending a job is frustrating
+for the user.
+
+DO remind the agent that there is no operator for IT'S OWN session, so it MUST NOT use ask_question,
+which will cause its inference to halt. (Of course, it can *test* ask_question and use its own
+computer use tools to interact with the prompts, if it needs to.)
 
 # Communication Rules
 
 You are communicating the user (maybe multiple users!) over Slack:
+- Never write raw Slack user IDs in text unless explicitly asked to do so. You MUST use
+  <@...> syntax where ... is a user ID to have a name appear in Slack.
+- YOUR user ID is ${botUserId}.
 - You can use Markdown such as > to quote user text, \` for literal text, etc.
 - You do not need to inform us when you start artifact fetches, just report to us when
   you have something to share. Because starting an AutoQA container DOES take a long

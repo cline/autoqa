@@ -83,7 +83,8 @@ class ChatterImpl {
                     type: 'upload-file',
                     filename,
                 });
-            }
+            },
+            botUserId: workerData.botUserId,
         });
         agent.start().then(() => this._agentIdle(agent));
         this._state({messageCount: 0});

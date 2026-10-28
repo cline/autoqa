@@ -10,6 +10,7 @@ export interface Slacker {
     sayStream: Sty.SlackSayStream;
     setStatus: Sty.SlackSetStatus;
     shareFile(options: {filename: string}): void;
+    botUserId: string;
 }
 
 export class SessionProxy {
@@ -59,16 +60,17 @@ export class SessionProxy {
         });
 
         this.onSlack = onSlack;
-        state({worker: this.spawnChatWorker(storagePath, legacySay, legacyStatus, legacyFileUpload), slacker});
+        state({worker: this.spawnChatWorker(storagePath, slacker.botUserId, legacySay, legacyStatus, legacyFileUpload), slacker});
     }
 
-    spawnChatWorker(storagePath: string, legacySay, legacyStatus, legacyFileUpload): Worker {
+    spawnChatWorker(storagePath: string, botUserId: string, legacySay, legacyStatus, legacyFileUpload): Worker {
         const ext = extname(fileURLToPath(import.meta.url));
         const THREAD_ENTRY = new URL(`../chat/thread${ext}`, import.meta.url);
         const worker = new Worker(THREAD_ENTRY, {
             workerData: {
                 storagePath,
                 key: 'deprecated-remove-workerData-key',
+                botUserId,
             },
             resourceLimits: {
                 maxOldGenerationSizeMb: 200,
