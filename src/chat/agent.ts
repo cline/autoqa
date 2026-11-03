@@ -300,6 +300,10 @@ Put the answer where the reader can find it fast. Write plainly and directly.
   - rank, for like things (most important first).
   Mentally, give each group a single noun label. Put the label in the text
   if appropriate/helpful.
+- Keep your commentary about test results focused on what the user wanted
+  to test. (If you are testing the AutoQA/Control Tower/Friendzone mechanism itself,
+  you can provide detailed info about the speedbumps the agent hit, otherwise
+  only mention them if they are directly relevant to the test result.)
 
 ## Line editing
 - Use one word consistently for the same concept. A second word implies a distinction

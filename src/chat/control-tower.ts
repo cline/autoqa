@@ -58,6 +58,7 @@ export class ControlTower {
     private watch(jobId: string): void {
         this.watchedJobs.set(jobId, '');
         if (!this.watcherInterval) {
+            console.log('starting to watch jobs')
             this.watcherInterval = setInterval(() => this.fetchWatchedJobs(), 3 * 60 * 1000);
         }
     }
@@ -65,37 +66,47 @@ export class ControlTower {
     private unwatch(jobId: string): void {
         this.watchedJobs.delete(jobId);
         if (this.watchedJobs.size === 0 && this.watcherInterval) {
+            console.log('no jobs left to watch');
             clearTimeout(this.watcherInterval);
             this.watcherInterval = undefined;
         }
     }
 
     private async fetchWatchedJobs(): Promise<void> {
-        const statuses = await this.client.list();
-        const buffer = [];
-        for (const [watchedJobId, oldStatus] of this.watchedJobs.entries()) {
-            const job = statuses.jobs.find(job => job.submission.id === watchedJobId);
-            if (!job) {
-                buffer.push(`${watchedJobId} was not found; we will stop watching this job. Re-list/watch if necessary.`);
-                this.watchedJobs.delete(watchedJobId);
-                continue;
+        try {
+            const statuses = await this.client.list();
+            const buffer = [];
+            for (const [watchedJobId, oldStatus] of this.watchedJobs.entries()) {
+                const job = statuses.jobs.find(job => job.submission.id === watchedJobId);
+                if (!job) {
+                    buffer.push(`${watchedJobId} was not found; we will stop watching this job. The job may have completed. Re-list/watch if necessary.`);
+                    this.watchedJobs.delete(watchedJobId);
+                    continue;
+                }
+                const stringified = JSON.stringify(job);
+                if (stringified !== oldStatus) {
+                    // Note! If this loop becomes async, you must retest watchedJobs.has(watchedJobId) here.
+                    // Otherwise this update will re-register the watch.
+                    this.watchedJobs.set(watchedJobId, stringified);
+                    buffer.push(`${watchedJobId} has changed status: ${stringified}`);
+                }
             }
-            const stringified = JSON.stringify(job);
-            if (stringified !== oldStatus) {
-                // Note! If this loop becomes async, you must retest watchedJobs.has(watchedJobId) here.
-                // Otherwise this update will re-register the watch.
-                this.watchedJobs.set(watchedJobId, stringified);
-                buffer.push(`${watchedJobId} has changed status: ${stringified}`);
-            }
-        }
-        if (buffer.length) {
-            if (this.watchedJobs.size === 0 && this.watcherInterval) {
-                clearInterval(this.watcherInterval);
-                this.watcherInterval = undefined;
-            }
+            if (buffer.length) {
+                if (this.watchedJobs.size === 0 && this.watcherInterval) {
+                    console.log('no jobs left to watch');
+                    buffer.push('NO jobs are being watched now. Re-list/watch if necessary.')
+                    clearInterval(this.watcherInterval);
+                    this.watcherInterval = undefined;
+                }
 
-            this.notify(`Updates about watched jobs:
-${buffer.join('\n')}`);
+                console.log('notifying about watched job status changes');
+                this.notify(`Updates about watched jobs:
+    ${buffer.join('\n')}`);
+            } else {
+                console.log(`no updates about ${this.watchedJobs.size} watched jobs`);
+            }
+        } catch (error) {
+            console.error(`fetchWatchedJobs: ${error}: ${error.stack}`)
         }
     }
 
