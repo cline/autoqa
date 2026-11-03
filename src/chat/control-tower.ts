@@ -1,15 +1,24 @@
 import { createTool } from '@cline/sdk';
 import type { AgentToolContext } from '@cline/sdk';
 
+export type JobConfiguration = {
+    setupScript?: string,
+    // One-line description for inclusion in the instance tool description.
+    slackAgentBlurb: string,
+    // Paragraph-length description for inclusion in the Slack agent system prompt.
+    slackAgentPrompt?: string,
+};
+
+export type JobConfigurations = {
+    // These types must match control tower's config.yaml labels (for now.)
+    [JobType in 'linux' | 'windows']?: JobConfiguration;
+};
+
 export interface ControlTowerOptions {
     /** The operator listener, reached on the controller host or through `ssh -L`. */
     baseUrl?: string;
     workerProfile?: string;
-    /** Instructions every job needs for the Windows setup to succeed; prepended to each task. */
-    promptPreamble?: string;
-    /** Appended after each task, e.g. how to report results. */
-    promptSuffix?: string;
-    setupScript?: string;
+    jobConfigurations: JobConfigurations;
     /** Tags submissions. cancel_qa_job only acts on jobs with this source. */
     source?: string;
     /** Control Tower serializes work behind one lock, so allow more than request_timeout_secs. */
@@ -37,15 +46,12 @@ export class ControlTower {
     private readonly watchedJobs = new Map<string, string>()
     private watcherInterval: NodeJS.Timeout | undefined
     private readonly client: ReturnType<typeof createClient>;
-    // TODO: These should vary by job type, but we only have one job type!
-    private readonly configurationOptions: {promptPreamble: string, promptSuffix: string, setupScript: string};
+    private readonly configurationOptions: {jobConfigurations: JobConfigurations};
 
-    constructor(private readonly notify: (message: string) => void, options: ControlTowerOptions = {}) {
+    constructor(private readonly notify: (message: string) => void, options: ControlTowerOptions) {
         this.client = createClient(options);
         this.configurationOptions = {
-            promptPreamble: options.promptPreamble,
-            promptSuffix: options.promptSuffix,
-            setupScript: options.setupScript,
+            jobConfigurations: options.jobConfigurations,
         };
     }
 
@@ -97,7 +103,7 @@ ${buffer.join('\n')}`);
         // TODO: Consider naming the requesting user is the source.
         const source = 'autoqa';
         const client = this.client;
-        const { promptPreamble, promptSuffix, setupScript } = this.configurationOptions;
+        const { jobConfigurations } = this.configurationOptions;
 
         async function find(ref: string, signal?: AbortSignal): Promise<Job> {
             const key = ref.trim().toLowerCase();
@@ -106,30 +112,38 @@ ${buffer.join('\n')}`);
             return job;
         }
 
-        const submit = createTool<{ title: string; task: string }, string>({
+        const submit = createTool<{ title: string; task: string, configuration: string }, string>({
             name: 'submit_qa_job',
             description:
                 'Start a QA run on a fresh VM. Returns at once with the job ID; the run takes ' +
-                'minutes to hours. Check on it later with list_qa_jobs.',
+                'minutes to hours. Check on it later with list_qa_jobs. There are the following ' +
+                'job types:\n' +
+                Object.entries(jobConfigurations).map(
+                    ([name, config]) => `- ${name}: ${config.slackAgentBlurb}\n`).join(''),
             inputSchema: {
                 type: 'object',
                 properties: {
                     title: {type: 'string', description: 'Short human-readable name, at most 512 bytes.'},
                     task: {type: 'string', description: 'What the worker should test, in plain language.'},
+                    configuration: {type: 'string', description: `The type of job to run, one of ${Object.keys(jobConfigurations).join(', ')}`},
                 },
-                required: ['title', 'task'],
+                required: ['title', 'task', 'configuration'],
                 additionalProperties: false,
             },
-            async execute(input: { title: string; task: string }, context: AgentToolContext) {
+            async execute(input: { title: string; task: string, configuration: string }, context: AgentToolContext) {
+                const jobType = input.configuration;
+                const jobConfiguration = jobConfigurations[jobType];
+                if (!jobConfiguration) {
+                    throw new Error(`configuration must be one of ${Object.keys(jobConfigurations).join(', ')}`);
+                }
                 const job = await client.submit(
                     {
                         id: crypto.randomUUID(),
-                        // TODO: add the worker profile to the tool options
-                        worker_profile: 'windows',
+                        worker_profile: jobType,
                         title: input.title,
                         source,
-                        prompt: [promptPreamble, input.task, promptSuffix].filter(Boolean).join('\n\n'),
-                        setup_script: setupScript ?? '',
+                        prompt: input.task,
+                        setup_script: jobConfiguration.setupScript ?? '',
                     },
                     context.signal,
                 );

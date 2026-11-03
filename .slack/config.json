@@ -2,7 +2,7 @@
   "display_information": {
     "name": "AutoQA",
     "description": "Interactive testing, on demand",
-    "long_description": "🚨 Alpha version, feedback welcome. 🚧\r\n\r\nTests Cline (CLI, VSCode, and Desktop) on Windows machines in the cloud with clicking and typing, and sends you screenshots and reports when it is done. Can even test SSH scenarios.\r\n\r\n*Known issues:*\r\n- Takes a few minutes. We will ping you when done.\r\n- Only Windows right now.\r\n- Can only *read* from GitHub. It can repro your issues, PRs, and test cases you describe.\r\n- No JetBrains IDEs (because no access to our private repos yet. intellij-jetbrains is in a private repo.)\r\n- No Cloud sessions or app dashboard testing (because that would open access to our repos.)\r\n\r\n*Feedback? Issues?* Ping @dominic.",
+    "long_description": "🚨 Alpha version, feedback welcome. 🚧\r\n\r\nTests Cline (CLI, VSCode, and Desktop) on Windows and Linux machines in the cloud with clicking and typing, and sends you screenshots and reports when it is done.\r\n\r\n*Known issues:*\r\n- Takes a few minutes. We will ping you when done.\r\n- Can only *read* from GitHub. It can repro your issues, PRs, and test cases you describe.\r\n- No JetBrains IDEs (because no access to our private repos yet. intellij-jetbrains is in a private repo.)\r\n- No Cloud sessions or app dashboard testing (because that would open access to our repos.)\r\n\r\n*Feedback? Issues?* Ping @dominic.",
     "background_color": "#663399"
   },
   "features": {
@@ -20,7 +20,8 @@
         "groups:history",
         "mpim:history",
         "channels:history",
-        "reactions:write"
+        "reactions:write",
+        "files:write"
       ]
     },
     "pkce_enabled": false

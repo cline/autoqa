@@ -9,7 +9,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "dev": "tsc-watch --noClear --onSuccess \"node --enable-source-maps --inspect --env-file=.env dist/index.js\"",
+    "dev": "tsc-watch --noClear --onSuccess \"node --enable-source-maps --inspect --env-file=.env.dev dist/index.js\"",
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"

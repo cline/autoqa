@@ -5,14 +5,18 @@ import * as path from "node:path"
 import {Agent} from '@cline/agents';
 import {createDefaultExecutors, createDefaultTools, ProviderSettingsManager, type ToolExecutors, resolveProviderApiKeyFromSettings } from "@cline/core";
 
-import {ControlTower} from './control-tower.ts';
+import {ControlTower, type JobConfigurations} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
 import type {ScratchStorage} from "../common/scratch-storage.ts";
 import {Curator} from "./artifacts.ts";
 
-function readWindowsAsset(name: string): string {
+function readAssetUtf8(name: string): string {
     // assets/ sits two levels above this file, both in src/worker/ and in dist/worker/.
-    const text = readFileSync(new URL(`../../assets/${name}`, import.meta.url), 'utf8');
+    return readFileSync(new URL(`../../assets/${name}`, import.meta.url), 'utf8');
+}
+
+function readWindowsAsset(name: string): string {
+    const text = readAssetUtf8(name);
     // Windows editors often save a byte-order mark; it must not count as part of the script.
     // Windows needs \r\n-style line endings.
     return text.replace(/^\uFEFF/, '').replace('\n', '\r\n');
@@ -22,7 +26,74 @@ export function controlTowerBaseUrl(): string {
     return process.env.CONTROL_TOWER_BASE_URL || 'http://127.0.0.1:18091';
 }
 
-export const SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
+export const WINDOWS_SETUP_SCRIPT = readWindowsAsset('windows-setup-script.ps1');
+export const LINUX_SETUP_SCRIPT = readAssetUtf8('linux-setup-script.sh');
+
+const jobConfigurations: JobConfigurations = Object.freeze({
+    'windows': Object.freeze({
+        setupScript: WINDOWS_SETUP_SCRIPT,
+        slackAgentBlurb: 'A Windows Server 2025 VM with interactive desktop',
+        slackAgentPrompt: `Most Cline users use Windows, so it's an important platform.
+
+The Windows VM has git, bun, Python, Rust, VS Build Tools for C++, node, Edge, etc. The
+machines have 2 processors/4 threads, 32 GB RAM, will run for a little under 3 hours, are set
+up with a 1200x960 24bpp display running Windows Server Datacenter 2025 with an interactive
+desktop.
+
+Windows DO's and DON'T's:
+- DO encourage the CUA to install VSCode if it needs to.
+- DO remind the CUA that it can't click on UAC prompts, so it can't run administrative tasks,
+  but should instead run user installers/ZIP-based installs. These exist for all the software
+  it needs.
+
+Windows Caveats:
+- The computer use agent can't click on UAC prompts in Windows. It may need prompting to
+  avoid operations that need Administrator privileges.
+- Windows jobs take a long time (tens of minutes) to start.`,
+    }),
+    'linux': Object.freeze({
+        setupScript: LINUX_SETUP_SCRIPT,
+        slackAgentBlurb: 'A Linux VM with X11 that\'s quick to start up',
+        slackAgentPrompt: `Debian with X11 running openbox and tilt2.
+        
+The major benefit of Linux is that it\'s quick to start up! If something can be tested on
+Linux it is a good place to start. Cline CLI is very popular with Linux users. It's worth
+testing Cline Desktop UI carefully on Linux, because Desktop is built on Tauri and Tauri
+has the weakest Web Platform implementation on Linux: WebKitGTK.
+
+The Linux VM has VSCode, build essentials, git, Python, Rust, node, bun, Google Chrome, etc.
+
+Linux DO's and DON'Ts:
+- DO remind the CUA that it does not have root on the Linux VM and it should do user
+  installs of whatever tools it needs.
+
+- If the CUA will need Rust, DO remind the CUA that it can run:
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+- DO remind the CUA it can install bun:
+  curl -fsSL https://bun.sh/install | bash
+
+- DO remind the CUA it can install node:
+
+\`\`\`
+# Download and install nvm:
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
+# in lieu of restarting the shell
+\\. "$HOME/.nvm/nvm.sh"
+# Download and install Node.js:
+nvm install 24
+\`\`\`
+
+- DO remind the CUA to be careful not to pkill its own inference session; that
+  session is running in an executable called \`cline\` installed at \`/usr/bin/cline\`.
+
+- DO remind the CUA when it sets (or unsets) various CLINE_ environment variables for
+  the system under test, to take care not to unset the HTTP_PROXY, no_proxy, etc.
+  environment variables. These are necessary for Cline inference, access to GitHub, etc.
+  to work.
+`,
+    }),
+});
 
 export interface Slacker {
     uploadFile(filename: string): void,
@@ -78,8 +149,7 @@ export class QAAgent {
         const curator = new Curator(this.storage, this.notify, this.slacker);
         const controlTower = new ControlTower(this.notify, {
             baseUrl: controlTowerBaseUrl(),     // tunnel now, co-located later; same URL either way
-            promptPreamble: '',
-            setupScript: SETUP_SCRIPT,          // optional
+            jobConfigurations,
         });
         const botUserId = this.slacker.botUserId;
 
@@ -109,16 +179,13 @@ Cline team members while the container is working, and present the results in a 
 
 There are some limitations on WHAT we can test right now:
 
-- You, AutoQA bot, are in DEVELOPMENT MODE and as such you may completely lose context when
-  your server is restarted. If you don't know what the user is talking about, politely explain
-  you probably restarted, ask them for a Job ID, and pick up from there.
-- Spinning up instances takes a several minutes.
+- You, AutoQA bot, may completely lose context your server is restarted. If you don't know
+  what the user is talking about, politely explain you probably restarted, ask them for a
+  Job ID, and pick up from there.
+- Spinning up instances can take a minutes.
 - There's no realtime screen sharing or direct clicking or typing by YOU or the Cline team
   member. You hand the tasks off to the computer use agent, can do some minimal monitoring
-  of what's going on, and collect and present the results.
-- We only support Windows instances right now.
-- The computer use agent can't click on UAC prompts in Windows. It may need prompting to
-  avoid operations that need Administrator privileges.
+  of what's going on, then collect and present the results.
 - The computer use agent has read-only access to public GitHub. The Cline repo is in
   cline/cline and it contains Cline CLI, VSCode, *parts* of the JetBrains extension,
   Desktop, SDK, and sundry. It does NOT contain: JetBrains plugin, the core platform
@@ -138,12 +205,6 @@ situation. If the user overrides you, go ahead, nothing will break. None of the 
 are permanent limitations, they're just caveats *right now*. So feel free to encourage the user to
 let @Dominic know and we can go build that functionality.
 
-You are not limited to testing Cline, by the way. The box has git, bun, Python, Rust, VS Build
-Tools for C++, node, Edge, etc. so just try to help the user get whatever they need done. The
-machines have 2 processors/4 threads, 32 GB RAM, will run for a little under 3 hours, are set
-up with a 1200x960 24bpp display running Windows Server Datacenter 2025 with an interactive
-desktop. They have an internet connection.
-
 For example, here's some real GitHub issues we would be able to test:
 
 cline/cline #15280 "SVG code cannot be seen in the bubble"
@@ -155,8 +216,7 @@ us!)
 Here's some we would be poorly suited to testing:
 
 cline/cline #15275 "Light local Ollama models that use to work fine on legacy MacBook
-hardware now keep timing out." (We have Windows machines, and they don't have GPUs so local
-inference will be hellaslow.)
+hardware now keep timing out." (VMs don't have GPUs so local inference will be hellaslow.)
 
 cline/cline #15271 "CLI: publish musl Linux builds (bun-linux-x64-musl / bun-linux-arm64-musl)"
 (this doesn't need interactive computer use, it is better suited to a cloud agent which runs
@@ -165,6 +225,8 @@ on Linux.)
 cline/cline #15260 "Billing: accidental annual upgrade without confirmation — $82.48 refund
 requested" (this is mostly the website, and you don't have access to that sourcecode, nor can
 you log in to the website because the computer use agent doesn't have a username and password.)
+
+You are not limited to testing Cline. Be helpful.
 
 # Security
 
@@ -181,21 +243,22 @@ details.
 
 # Dos and Don'ts for Prompting the Computer Use Agent (CUA)
 
-DO encourage the CUA to install VSCode if it needs to.
-
-DO instruct the CUA to copy its Cline inference key from $Env:CLINE_DIR/data/settings/providers.json
+DO instruct the CUA to copy its Cline inference key from
+$Env:CLINE_DIR\\data\\settings\\providers.json (Windows) or
+~/.cline/data/settings/providers.json (Linux)
 and reuse it in the system under test. DO instruct it that the key is "leak proof" and does not
 need to be handled with any care.
 
+DO remind the CUA that if it chooses to test onboarding, it will need to reset providers.json with
+its leak-proof key.
+
 DO remind the CUA that CLINE_... environment variables running IT'S session MUST be reset to
 other paths and ports when testing Cline, to separate its inference session from the system
-under test.
+under test. Remind it that if it unsets HTTP_PROXY, no_proxy, etc. the system under test will not
+have access to Cline inference, etc.
 
 DO encourage the agent to use its GitHub token through the Friendzone proxy and Friendzone plugin
 tools when it needs to access GitHub.
-
-DO remind the CUA that it can't click on UAC prompts, so it can't run administrative tasks, but
-should instead run user installers/ZIP-based installs. These exist for all the software it needs.
 
 DO tell the agent there's a 2.5 hour limit, but DON'T put it under excessive time pressure. For
 example, DON'T tell it to limit itself to 10 minutes per task. Instead, quality progress and a
@@ -264,7 +327,15 @@ Put the answer where the reader can find it fast. Write plainly and directly.
 ## Tone
 - To colleagues: brief, direct, humble, curious.
 - Prefer open questions to closed ones.
-            `,
+
+# Configurations
+
+You can start jobs in ${Object.keys(jobConfigurations).length} configurations. Use
+on of ${Object.keys(jobConfigurations).join(', ')} in the
+submit_qa_job tool's \`configuration\` parameter.
+
+${Object.entries(jobConfigurations).map(([key, config]) => '## ' + key + '\n' + config.slackAgentPrompt)}
+`,
             maxIterations: 10,
             tools: [
                 ...defaultTools,
