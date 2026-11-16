@@ -2,24 +2,31 @@ import * as fs from "node:fs/promises"
 import { readFileSync } from 'node:fs';
 import * as path from "node:path"
 
-import {Agent} from '@cline/agents';
-import {createDefaultExecutors, createDefaultTools, ProviderSettingsManager, type ToolExecutors, resolveProviderApiKeyFromSettings } from "@cline/core";
+import {Agent, type AgentRunResult} from '@cline/agents';
+import {createContextCompactionPrepareTurn, createDefaultExecutors, createDefaultTools, ProviderSettingsManager, type ToolExecutors, resolveProviderApiKeyFromSettings } from "@cline/core";
 
 import {ControlTower, type JobConfigurations} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
 import type {ScratchStorage} from "../common/scratch-storage.ts";
+import type {PersistedSessionState} from "../common/types.ts";
 import {Curator} from "./artifacts.ts";
 
+export const DEFAULT_MODEL_ID = process.env.AUTOQA_MODEL_ID || 'anthropic/claude-opus-5.5';
+const SESSION_STATE_FILENAME = '.session-state.json';
+
 function readAssetUtf8(name: string): string {
-    // assets/ sits two levels above this file, both in src/worker/ and in dist/worker/.
+    // assets/ sits two levels above this file, both in src/chat/ and in dist/chat/.
     return readFileSync(new URL(`../../assets/${name}`, import.meta.url), 'utf8');
 }
 
-function readWindowsAsset(name: string): string {
-    const text = readAssetUtf8(name);
+function normalizeWindowsLineEndings(text: string): string {
     // Windows editors often save a byte-order mark; it must not count as part of the script.
-    // Windows needs \r\n-style line endings.
-    return text.replace(/^\uFEFF/, '').replace('\n', '\r\n');
+    // Windows needs \r\n-style line endings on every line.
+    return text.replace(/^\uFEFF/, '').replace(/\r?\n/g, '\r\n');
+}
+
+function readWindowsAsset(name: string): string {
+    return normalizeWindowsLineEndings(readAssetUtf8(name));
 }
 
 export function controlTowerBaseUrl(): string {
@@ -131,26 +138,73 @@ export function createRootedReadExecutor(
     }
 }
 
+async function loadSessionState(storage: ScratchStorage): Promise<PersistedSessionState | undefined> {
+    const filePath = await storage.checked(SESSION_STATE_FILENAME);
+    try {
+        const raw = await fs.readFile(filePath, 'utf8');
+        const parsed = JSON.parse(raw) as PersistedSessionState;
+        if (parsed && parsed.version === 1 && Array.isArray(parsed.messages)) {
+            return parsed;
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            console.error(`Failed to read persisted session state at ${filePath}:`, error);
+        }
+    }
+    return undefined;
+}
+
+let saveCounter = 0;
+async function saveSessionState(storage: ScratchStorage, state: PersistedSessionState): Promise<void> {
+    const filePath = await storage.checked(SESSION_STATE_FILENAME);
+    const tmpPath = await storage.checked(`${SESSION_STATE_FILENAME}.${++saveCounter}.tmp`);
+    await fs.writeFile(tmpPath, JSON.stringify(state), 'utf8');
+    await fs.rename(tmpPath, filePath);
+}
+
 export class QAAgent {
     private readonly storage: ScratchStorage;
     private readonly slacker: Slacker;
     private readonly notify: (message: string) => void;
+    private readonly onActivityChange: (() => void) | undefined;
+    private restoredExtraFields: Record<string, unknown> = {};
     private agent: Agent | undefined;
+    private curator: Curator | undefined;
+    private controlTower: ControlTower | undefined;
 
-    constructor(storage: ScratchStorage, notify: (message: string) => void, slacker: Slacker) {
+    constructor(
+        storage: ScratchStorage,
+        notify: (message: string) => void,
+        slacker: Slacker,
+        options: { onActivityChange?: () => void } = {},
+    ) {
         this.storage = storage;
         this.notify = notify;
         this.slacker = slacker;
+        this.onActivityChange = options.onActivityChange;
     }
 
-    async start(): Promise<void> {
+    async start(): Promise<{ messageCount: number }> {
+        const restored = await loadSessionState(this.storage);
+        if (restored) {
+            const { version: _v, messages: _m, messageCount: _c, watchedJobs: _w, fetchedArtifacts: _f, ...extra } = restored;
+            this.restoredExtraFields = extra;
+        }
         const providerSettingsManager = new ProviderSettingsManager();
-        const apiKey = resolveProviderApiKeyFromSettings(providerSettingsManager, "cline");
-        const curator = new Curator(this.storage, this.notify, this.slacker);
+        const resolvedApiKey = resolveProviderApiKeyFromSettings(providerSettingsManager, "cline") || process.env.CLINE_API_KEY;
+        const modelId = DEFAULT_MODEL_ID;
+        const curator = new Curator(this.storage, this.notify, this.slacker, {
+            initialArtifacts: restored?.fetchedArtifacts,
+            onActivityChange: this.onActivityChange,
+        });
         const controlTower = new ControlTower(this.notify, {
             baseUrl: controlTowerBaseUrl(),     // tunnel now, co-located later; same URL either way
             jobConfigurations,
+            initialWatchedJobs: restored?.watchedJobs,
+            onActivityChange: this.onActivityChange,
         });
+        this.curator = curator;
+        this.controlTower = controlTower;
         const botUserId = this.slacker.botUserId;
 
         const defaultTools = createDefaultTools({
@@ -164,10 +218,42 @@ export class QAAgent {
             throw new Error('too many/few default tools; only wanted a read_file tool');
         }
 
+        const compactTurn = createContextCompactionPrepareTurn({
+            providerId: 'cline',
+            modelId,
+            apiKey: resolvedApiKey,
+            compaction: {
+                enabled: true,
+                strategy: 'basic',
+            },
+        });
+
         this.agent = new Agent({
             providerId: 'cline',
-            apiKey: apiKey || process.env.CLINE_API_KEY,
-            modelId: 'anthropic/claude-sonnet-5.5',
+            apiKey: resolvedApiKey,
+            modelId,
+            initialMessages: restored?.messages,
+            prepareTurn: compactTurn
+                ? async (ctx) => compactTurn({
+                    agentId: ctx.agentId,
+                    conversationId: ctx.conversationId ?? ctx.agentId,
+                    parentAgentId: ctx.parentAgentId ?? null,
+                    iteration: ctx.iteration,
+                    messages: [...ctx.messages],
+                    apiMessages: [...ctx.messages],
+                    abortSignal: ctx.signal ?? new AbortController().signal,
+                    systemPrompt: ctx.systemPrompt ?? '',
+                    tools: [...ctx.tools],
+                    model: {
+                        id: ctx.model.id ?? modelId,
+                        provider: ctx.model.provider ?? 'cline',
+                        info: ctx.model.info,
+                    },
+                    overflowRecovery: ctx.overflowRecovery,
+                    previousRequestInputTokens: ctx.previousRequestInputTokens,
+                    emitStatusNotice: ctx.emitStatusNotice,
+                })
+                : undefined,
             systemPrompt: `You are a QA agent called AutoQA.
  
 You are the interface between the Cline team, and cloud infrastructure which spins up VMs
@@ -269,6 +355,21 @@ DO remind the agent that there is no operator for IT'S OWN session, so it MUST N
 which will cause its inference to halt. (Of course, it can *test* ask_question and use its own
 computer use tools to interact with the prompts, if it needs to.)
 
+# When to Start a Job
+
+Starting a VM takes minutes and real cloud resources, and teammates on Slack often write in
+bursts—mentioning <@${botUserId}> in a short opener before pasting links, repro steps, or build
+targets in the next message.
+
+- Do NOT call \`submit_qa_job\` right away if more details appear to be on the way (for example,
+  a bare mention, "one sec", "let me grab the PR", or a half-finished thought), or if key facts
+  needed for a meaningful test are missing and cannot be looked up with \`github_graphql\` (which
+  issue, PR, surface, or behavior to check).
+- When context looks incomplete, acknowledge briefly or ask one direct, open question first.
+  Start the VM once you know what to test and what outcome to verify.
+- \`submit_qa_job\` automatically watches the job and sends you notifications as its phase changes
+  and when it finishes. Do not poll \`list_qa_jobs\` in a loop while waiting.
+
 # Communication Rules
 
 You are communicating the user (maybe multiple users!) over Slack:
@@ -343,14 +444,38 @@ ${Object.entries(jobConfigurations).map(([key, config]) => '## ' + key + '\n' + 
             maxIterations: 10,
             tools: [
                 ...defaultTools,
-                createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN}),
+                createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN ?? ''}),
                 ...controlTower.createTools(),
                 ...curator.createTools(),
             ],
         });
+
+        return { messageCount: restored?.messageCount ?? 0 };
     }
 
-    async process(message: string): Promise<string> {
+    hasActiveBackgroundWork(): boolean {
+        return Boolean(this.controlTower?.hasWatchedJobs() || this.curator?.hasActiveFetches());
+    }
+
+    async saveState(messageCount: number): Promise<void> {
+        if (!this.agent) {
+            return;
+        }
+        await saveSessionState(this.storage, {
+            ...this.restoredExtraFields,
+            version: 1,
+            messages: [...this.agent.snapshot().messages],
+            messageCount,
+            watchedJobs: this.controlTower?.getWatchedJobs() ?? [],
+            fetchedArtifacts: this.curator?.getFetchedArtifacts() ?? [],
+        });
+    }
+
+    dispose(): void {
+        this.controlTower?.dispose();
+    }
+
+    async process(message: string): Promise<AgentRunResult> {
         if (!this.agent) {
             throw new Error('invalid state, call start() first');
         }

@@ -2,16 +2,28 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 export class ScratchStorage implements AsyncDisposable {
-    private readonly parentPlusPrefix: string
+    private readonly parentPlusPrefix: string | undefined;
+    private readonly existingRoot: string | undefined;
     private _root: Promise<fs.DisposableTempDir> | undefined;
 
-    constructor(parent: string, prefix: string) {
-        this.parentPlusPrefix = path.resolve(path.join(parent, prefix));
+    constructor(parent: string, prefix: string, existingRoot?: string) {
+        if (existingRoot) {
+            this.existingRoot = path.resolve(existingRoot);
+        } else {
+            this.parentPlusPrefix = path.resolve(path.join(parent, prefix));
+        }
+    }
+
+    public static existing(rootPath: string): ScratchStorage {
+        return new ScratchStorage('', '', rootPath);
     }
 
     public async root(): Promise<string> {
+        if (this.existingRoot) {
+            return this.existingRoot;
+        }
         if (!this._root) {
-            this._root = fs.mkdtempDisposable(this.parentPlusPrefix);
+            this._root = fs.mkdtempDisposable(this.parentPlusPrefix!);
         }
         return (await this._root).path;
     }
@@ -20,7 +32,6 @@ export class ScratchStorage implements AsyncDisposable {
     // `s` may be specified as a relative OR absolute path.
     public async checked(s: string): Promise<string> {
         const root = await this.root();
-        console.log(root, s)
         const p = path.resolve(root, s);
         const relative = path.relative(root, p);
         if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
@@ -34,9 +45,11 @@ export class ScratchStorage implements AsyncDisposable {
     }
 
     public async [Symbol.asyncDispose](): Promise<void> {
-        if (this._root) {
-            await this._root[Symbol.asyncDispose]();
+        const pending = this._root;
+        if (pending) {
             this._root = undefined;
+            const dir = await pending;
+            await dir[Symbol.asyncDispose]();
         }
     }
 }

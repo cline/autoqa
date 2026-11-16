@@ -12,20 +12,56 @@ import type {AgentTool, AgentToolContext } from '@cline/sdk';
 import type {ScratchStorage} from "../common/scratch-storage.ts";
 import {controlTowerBaseUrl, type Slacker} from "./agent.ts";
 
+export interface CuratorOptions {
+    baseUrl?: string;
+    fetchTimeoutMs?: number;
+    initialArtifacts?: Iterable<[string, string]>;
+    onActivityChange?: () => void;
+    fetch?: typeof fetch;
+}
+
 export class Curator {
     // Place to store artifacts.
     private readonly storage: ScratchStorage;
     // Notify the agent asynchronously that something has happened.
     private readonly notify: (message: string) => void;
     private readonly slacker: Slacker;
+    private readonly baseUrl: string;
+    private readonly fetchTimeoutMs: number;
+    private readonly onActivityChange: (() => void) | undefined;
+    private readonly doFetch: typeof fetch;
+    private activeFetches = 0;
 
     // Maps a job ID to a path, or to a running job.
-    private corpus: Map<string,string | Promise<string>> = new Map();
+    private corpus: Map<string, string | Promise<string>> = new Map();
 
-    constructor(storage: ScratchStorage, notify: (message: string) => void, slacker: Slacker) {
+    constructor(storage: ScratchStorage, notify: (message: string) => void, slacker: Slacker, options: CuratorOptions = {}) {
         this.storage = storage;
         this.notify = notify;
         this.slacker = slacker;
+        this.baseUrl = options.baseUrl ?? controlTowerBaseUrl();
+        this.fetchTimeoutMs = options.fetchTimeoutMs ?? 5 * 60 * 1000;
+        this.onActivityChange = options.onActivityChange;
+        this.doFetch = options.fetch ?? fetch;
+        if (options.initialArtifacts) {
+            for (const [jobId, relPath] of options.initialArtifacts) {
+                this.corpus.set(jobId, relPath);
+            }
+        }
+    }
+
+    public hasActiveFetches(): boolean {
+        return this.activeFetches > 0;
+    }
+
+    public getFetchedArtifacts(): [string, string][] {
+        const resolved: [string, string][] = [];
+        for (const [jobId, entry] of this.corpus.entries()) {
+            if (typeof entry === 'string') {
+                resolved.push([jobId, entry]);
+            }
+        }
+        return resolved;
     }
 
     public createTools(): AgentTool[] {
@@ -47,15 +83,22 @@ export class Curator {
             execute: async ({jobId}: { jobId: string }, _context: AgentToolContext): Promise<string> => {
                 const result = this.corpus.get(jobId);
                 if (!result) {
-                    const fetch = this.fetchArtifacts(jobId);
-                    this.corpus.set(jobId, fetch)
+                    const fetchPromise = this.fetchArtifacts(jobId);
+                    this.corpus.set(jobId, fetchPromise);
+                    this.activeFetches++;
+                    this.onActivityChange?.();
                     void (async () => {
                         try {
-                            const result = await fetch;
-                            this.corpus.set(jobId, result);
-                            this.notify(`Fetching job ${jobId} completed; artifacts are available at ${result}`);
+                            const fetchedPath = await fetchPromise;
+                            this.corpus.set(jobId, fetchedPath);
+                            this.onActivityChange?.();
+                            this.notify(`Fetching job ${jobId} completed; artifacts are available at ${fetchedPath}`);
                         } catch (error) {
-                            this.notify(`Fetching job ${jobId} failed: ${error}`)
+                            this.corpus.delete(jobId);
+                            this.notify(`Fetching job ${jobId} failed: ${error}`);
+                        } finally {
+                            this.activeFetches--;
+                            this.onActivityChange?.();
                         }
                     })();
                     return `Started fetching artifacts for job ${jobId}. Do not poll for results, you will be notified when artifacts are available.`;
@@ -125,32 +168,41 @@ export class Curator {
     }
 
     private async fetchArtifacts(jobId: string): Promise<string> {
-        const res = await fetch(`${controlTowerBaseUrl()}/api/jobs/${jobId}/artifact`);
+        const timeout = AbortSignal.timeout(this.fetchTimeoutMs);
+        const res = await this.doFetch(`${this.baseUrl}/api/jobs/${jobId}/artifact`, {
+            signal: timeout,
+        });
         if (!res.ok) {
             throw new Error(`could not fetch artifacts for job ${jobId}: (${res.status}) ${await res.text()}`);
         }
+        if (!res.body) {
+            throw new Error(`could not fetch artifacts for job ${jobId}: response had no body`);
+        }
         const archivePath = await this.storage.checked(`${jobId}.tar.zst`);
-        await pipeline(Readable.fromWeb(res.body!), createWriteStream(archivePath));
-        const outputPath = path.join(await this.storage.root(), jobId);
-        const MAX_TOTAL_SIZE_BYTES = 250_000_000;
-        let totalSizeBytes = 0;
-        await fs.mkdir(outputPath, { recursive: true });
-        await tar.x({
-            file: archivePath,
-            cwd: outputPath,
-            filter: (_path, entry: tar.ReadEntry) => {
-                if (entry.type !== 'File' && entry.type !== 'Directory') {
-                    return false;
-                }
-                if (entry.size + totalSizeBytes > MAX_TOTAL_SIZE_BYTES) {
-                    return false;
-                }
-                totalSizeBytes += entry.size;
-                return true;
-            },
-            zstd: true,
-        });
-        await fs.rm(archivePath);
-        return path.relative(await this.storage.root(), outputPath);
+        try {
+            await pipeline(Readable.fromWeb(res.body), createWriteStream(archivePath), { signal: timeout });
+            const outputPath = path.join(await this.storage.root(), jobId);
+            const MAX_TOTAL_SIZE_BYTES = 250_000_000;
+            let totalSizeBytes = 0;
+            await fs.mkdir(outputPath, { recursive: true });
+            await tar.x({
+                file: archivePath,
+                cwd: outputPath,
+                filter: (_path, entry: tar.ReadEntry) => {
+                    if (entry.type !== 'File' && entry.type !== 'Directory') {
+                        return false;
+                    }
+                    if (entry.size + totalSizeBytes > MAX_TOTAL_SIZE_BYTES) {
+                        return false;
+                    }
+                    totalSizeBytes += entry.size;
+                    return true;
+                },
+                zstd: true,
+            });
+            return path.relative(await this.storage.root(), outputPath);
+        } finally {
+            await fs.rm(archivePath, { force: true });
+        }
     }
 }
