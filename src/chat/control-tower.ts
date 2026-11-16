@@ -1,5 +1,6 @@
 import { createTool } from '@cline/sdk';
 import type { AgentToolContext } from '@cline/sdk';
+import { Joinery } from '../join.ts';
 
 export type JobConfiguration = {
     setupScript?: string,
@@ -23,6 +24,12 @@ export interface ControlTowerOptions {
     source?: string;
     /** Control Tower serializes work behind one lock, so allow more than request_timeout_secs. */
     timeoutMs?: number;
+    /** Poll cadence while jobs are watched. Status updates only fire when describe(job) changes. */
+    pollIntervalMs?: number;
+    /** Restored watched job snapshots ([jobId, serializedDescription]) when waking a hibernated worker. */
+    initialWatchedJobs?: Iterable<[string, string]>;
+    /** Invoked whenever the watched-job set transitions between empty and non-empty, or updates. */
+    onActivityChange?: () => void;
     fetch?: typeof fetch;
 }
 
@@ -43,70 +50,152 @@ interface Job {
 interface JobList { jobs: Job[] }
 
 export class ControlTower {
-    private readonly watchedJobs = new Map<string, string>()
-    private watcherInterval: NodeJS.Timeout | undefined
+    private readonly notify: (message: string) => void;
+    private readonly watchedJobs = new Map<string, string>();
+    private watcherInterval: NodeJS.Timeout | undefined;
+    private readonly pollIntervalMs: number;
+    private readonly onActivityChange: (() => void) | undefined;
     private readonly client: ReturnType<typeof createClient>;
     private readonly configurationOptions: {jobConfigurations: JobConfigurations};
+    private readonly pollJoinery = new Joinery((error) => {
+        console.error('ControlTower poll joinery error:', error);
+    });
+    private readonly pollIdle = this.pollJoinery.m<void>();
+    private readonly pollRequested = this.pollJoinery.m<void>();
 
-    constructor(private readonly notify: (message: string) => void, options: ControlTowerOptions) {
+    constructor(notify: (message: string) => void, options: ControlTowerOptions) {
+        this.notify = notify;
         this.client = createClient(options);
+        this.pollIntervalMs = options.pollIntervalMs ?? 30_000;
+        this.onActivityChange = options.onActivityChange;
         this.configurationOptions = {
             jobConfigurations: options.jobConfigurations,
         };
-    }
 
-    private watch(jobId: string): void {
-        this.watchedJobs.set(jobId, '');
-        if (!this.watcherInterval) {
-            console.log('starting to watch jobs')
-            this.watcherInterval = setInterval(() => this.fetchWatchedJobs(), 3 * 60 * 1000);
+        // Serialize polls through Joinery so timer ticks and immediate watch checks never overlap.
+        this.pollJoinery.on([this.pollIdle, this.pollRequested], async () => {
+            try {
+                await this.fetchWatchedJobs();
+            } finally {
+                this.pollIdle();
+            }
+        });
+        this.pollIdle();
+
+        if (options.initialWatchedJobs) {
+            for (const [jobId, status] of options.initialWatchedJobs) {
+                this.watchedJobs.set(jobId, status);
+            }
+            if (this.watchedJobs.size > 0) {
+                this.ensureWatcherRunning();
+                this.pollRequested();
+            }
         }
     }
 
-    private unwatch(jobId: string): void {
-        this.watchedJobs.delete(jobId);
-        if (this.watchedJobs.size === 0 && this.watcherInterval) {
-            console.log('no jobs left to watch');
-            clearTimeout(this.watcherInterval);
+    public hasWatchedJobs(): boolean {
+        return this.watchedJobs.size > 0;
+    }
+
+    public getWatchedJobs(): [string, string][] {
+        return Array.from(this.watchedJobs.entries());
+    }
+
+    public dispose(): void {
+        if (this.watcherInterval) {
+            clearInterval(this.watcherInterval);
             this.watcherInterval = undefined;
         }
     }
 
+    private ensureWatcherRunning(): void {
+        if (!this.watcherInterval) {
+            console.log('starting to watch jobs');
+            this.watcherInterval = setInterval(() => this.pollRequested(), this.pollIntervalMs);
+        }
+    }
+
+    private stopWatcherIfEmpty(): void {
+        if (this.watchedJobs.size === 0 && this.watcherInterval) {
+            console.log('no jobs left to watch');
+            clearInterval(this.watcherInterval);
+            this.watcherInterval = undefined;
+        }
+    }
+
+    private watch(jobId: string, initialStatus?: string): void {
+        const isNew = !this.watchedJobs.has(jobId);
+        if (initialStatus !== undefined || isNew) {
+            this.watchedJobs.set(jobId, initialStatus ?? '');
+        }
+        this.ensureWatcherRunning();
+        this.onActivityChange?.();
+        if (initialStatus === undefined) {
+            this.pollRequested();
+        }
+    }
+
+    private unwatch(jobId: string): void {
+        const deleted = this.watchedJobs.delete(jobId);
+        this.stopWatcherIfEmpty();
+        if (deleted) {
+            this.onActivityChange?.();
+        }
+    }
+
     private async fetchWatchedJobs(): Promise<void> {
+        if (this.watchedJobs.size === 0) {
+            this.stopWatcherIfEmpty();
+            return;
+        }
         try {
             const statuses = await this.client.list();
-            const buffer = [];
+            const buffer: string[] = [];
+            let stateChanged = false;
             for (const [watchedJobId, oldStatus] of this.watchedJobs.entries()) {
                 const job = statuses.jobs.find(job => job.submission.id === watchedJobId);
                 if (!job) {
-                    buffer.push(`${watchedJobId} was not found; we will stop watching this job. The job may have completed. Re-list/watch if necessary.`);
+                    buffer.push(`${watchedJobId} was not found; we will stop watching this job. The job may have completed or aged out. Re-list/watch if necessary.`);
                     this.watchedJobs.delete(watchedJobId);
+                    stateChanged = true;
                     continue;
                 }
-                const stringified = JSON.stringify(job);
+                // Compare describe(job) rather than raw Job so heartbeats (updated_at) and
+                // submission.prompt / submission.setup_script never bloat agent context.
+                const summary = describe(job);
+                const stringified = JSON.stringify(summary);
+                const isFinished = job.phase.kind === 'finished';
                 if (stringified !== oldStatus) {
-                    // Note! If this loop becomes async, you must retest watchedJobs.has(watchedJobId) here.
-                    // Otherwise this update will re-register the watch.
-                    this.watchedJobs.set(watchedJobId, stringified);
-                    buffer.push(`${watchedJobId} has changed status: ${stringified}`);
+                    if (isFinished) {
+                        this.watchedJobs.delete(watchedJobId);
+                        buffer.push(`${watchedJobId} has finished: ${stringified}`);
+                    } else {
+                        this.watchedJobs.set(watchedJobId, stringified);
+                        buffer.push(`${watchedJobId} has changed status: ${stringified}`);
+                    }
+                    stateChanged = true;
+                } else if (isFinished) {
+                    this.watchedJobs.delete(watchedJobId);
+                    stateChanged = true;
                 }
             }
-            if (buffer.length) {
-                if (this.watchedJobs.size === 0 && this.watcherInterval) {
-                    console.log('no jobs left to watch');
-                    buffer.push('NO jobs are being watched now. Re-list/watch if necessary.')
-                    clearInterval(this.watcherInterval);
-                    this.watcherInterval = undefined;
+            if (this.watchedJobs.size === 0 && this.watcherInterval) {
+                this.stopWatcherIfEmpty();
+                if (buffer.length) {
+                    buffer.push('All watched jobs have concluded; job watching has stopped.');
                 }
-
+            }
+            if (stateChanged) {
+                this.onActivityChange?.();
+            }
+            if (buffer.length) {
                 console.log('notifying about watched job status changes');
-                this.notify(`Updates about watched jobs:
-    ${buffer.join('\n')}`);
+                this.notify(`Updates about watched jobs:\n${buffer.join('\n')}`);
             } else {
                 console.log(`no updates about ${this.watchedJobs.size} watched jobs`);
             }
         } catch (error) {
-            console.error(`fetchWatchedJobs: ${error}: ${error.stack}`)
+            console.error(`fetchWatchedJobs: ${error}: ${(error as Error)?.stack}`);
         }
     }
 
@@ -123,12 +212,15 @@ export class ControlTower {
             return job;
         }
 
+        const self = this;
+
         const submit = createTool<{ title: string; task: string, configuration: string }, string>({
             name: 'submit_qa_job',
             description:
-                'Start a QA run on a fresh VM. Returns at once with the job ID; the run takes ' +
-                'minutes to hours. Check on it later with list_qa_jobs. There are the following ' +
-                'job types:\n' +
+                'Start a QA run on a fresh VM and automatically watch it for status changes. ' +
+                'Returns at once with the job ID; the run takes minutes to hours, and you will ' +
+                'be notified automatically as its phase changes and when it finishes. There are ' +
+                'the following job types:\n' +
                 Object.entries(jobConfigurations).map(
                     ([name, config]) => `- ${name}: ${config.slackAgentBlurb}\n`).join(''),
             inputSchema: {
@@ -142,7 +234,7 @@ export class ControlTower {
                 additionalProperties: false,
             },
             async execute(input: { title: string; task: string, configuration: string }, context: AgentToolContext) {
-                const jobType = input.configuration;
+                const jobType = input.configuration as keyof JobConfigurations;
                 const jobConfiguration = jobConfigurations[jobType];
                 if (!jobConfiguration) {
                     throw new Error(`configuration must be one of ${Object.keys(jobConfigurations).join(', ')}`);
@@ -158,7 +250,9 @@ export class ControlTower {
                     },
                     context.signal,
                 );
-                return render(describe(job));
+                const summary = describe(job);
+                self.watch(job.submission.id, JSON.stringify(summary));
+                return render({ ...summary, watching: true });
             },
         });
 
@@ -198,11 +292,14 @@ export class ControlTower {
                 if (job.submission.source !== source) {
                     throw new Error(`Job ${job.submission.id} was submitted by "${job.submission.source}", not ${source}.`);
                 }
-                return render(describe(await client.cancel(job.submission.id, context.signal)));
+                const cancelled = await client.cancel(job.submission.id, context.signal);
+                if (cancelled.phase.kind === 'finished') {
+                    self.unwatch(job.submission.id);
+                }
+                return render(describe(cancelled));
             },
         });
 
-        const self = this;
         const watch = createTool<{ id: string }, string>({
             name: 'watch_qa_job',
             description: `Watch a QA job for updates. You will get updates in messages.`,

@@ -19,7 +19,12 @@ type Formals<Ms extends readonly Mailbox<any>[]> = {
 }
 
 export class Joinery {
-    private patterns: [ms: readonly Mailbox<any>[], body: (...actuals: any) => void][] = []
+    private patterns: [ms: readonly Mailbox<any>[], body: (...actuals: any) => unknown][] = [];
+    private readonly onError: (error: unknown) => void;
+
+    constructor(onError: (error: unknown) => void = (error) => console.error('Unhandled Joinery reaction error:', error)) {
+        this.onError = onError;
+    }
 
     m<T>(): Mailbox<T> {
         const actuals: T[] = [];
@@ -43,7 +48,7 @@ export class Joinery {
 
     on<const Ms extends readonly Mailbox<any>[]>(
         mailboxes: Ms,
-        body: (...actuals: Formals<Ms>) => void,
+        body: (...actuals: Formals<Ms>) => unknown,
     ): void {
         if (mailboxes.length === 0) {
             throw new Error('patterns must have at least one mailbox');
@@ -65,10 +70,10 @@ export class Joinery {
                 // This is weakly typed; see how "on" ensures mailboxes and bodies line up.
                 const actuals = pattern.map(mailbox => mailbox[take]());
                 // TODO: We don't return this Promise to encourage use of joins instead.
-                // However we could gave a joinery-wide Promise for quiescence.
-                void Promise.resolve().then(() => {
-                    body.apply(undefined, actuals);
-                });
+                // However we could have a joinery-wide Promise for quiescence.
+                void Promise.resolve()
+                    .then(() => body.apply(undefined, actuals))
+                    .catch((error) => this.onError(error));
                 return;
             }
         }

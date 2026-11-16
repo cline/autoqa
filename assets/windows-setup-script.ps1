@@ -126,6 +126,7 @@ namespace Friendzone {
 
     $qwanban = Join-Path $env:USERPROFILE 'qwanban'
     $cline = Join-Path $env:USERPROFILE 'cline'
+    $clineExe = Join-Path $cline 'apps\cli\dist\cli-windows-x64\bin\cline.exe'
     Sync-Repo $qwanban 'main'
     Native cargo.exe @('install', '--locked', '--path', (Join-Path $qwanban 'qbt'))
     Sync-Repo $cline 'dpc/computer-use'
@@ -151,7 +152,6 @@ namespace Friendzone {
     Copy-Item -LiteralPath (Join-Path $env:CLINE_DIR 'data\settings\providers.json') -Destination $settings
 
     $qbt = Join-Path $env:USERPROFILE '.cargo\bin\qbt.exe'
-    $clineExe = Join-Path $cline 'apps\cli\dist\cli-windows-x64\bin\cline.exe'
     $artifacts = Join-Path $jobRoot 'artifacts'
     $env:CLINE_COMPUTER_USE_HOST = '127.0.0.1'
     $env:CLINE_COMPUTER_USE_PORT = '1234'
@@ -302,7 +302,7 @@ Exiting Cline or finishing a turn does not complete the job.
     Set-Location $env:USERPROFILE
     Write-Output 'starting cline'
     # No pipeline: the interactive TUI needs real terminal handles.
-    Native $clineExe @('--tui', '--auto-approve', 'true', '--data-dir', $state, '--',
+    Native $clineExe @('--tui', '--model', 'anthropic/claude-opus-5.5', '--auto-approve', 'true', '--data-dir', $state, '--',
         "Read and carry out the task and lifecycle instructions in $promptPath")
 }
 

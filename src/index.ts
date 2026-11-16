@@ -2,10 +2,10 @@
 // spinning up AutoQA test instances.
 
 import * as path from "node:path";
-import {App} from '@slack/bolt'
-import {WebClient} from '@slack/web-api'
-import * as Sty from './slack-types.ts'
-import {SessionProxy, type Slacker} from "./slack/chat.ts";
+import {App} from '@slack/bolt';
+import {WebClient} from '@slack/web-api';
+import * as Sty from './slack-types.ts';
+import {SessionProxy, Switchboard, type Slacker, type WorkerDeathInfo} from "./slack/chat.ts";
 import * as os from "node:os";
 import {ScratchStorage} from "./common/scratch-storage.ts";
 
@@ -15,39 +15,49 @@ const app = new App({
     socketMode: true,
 });
 
-// Connects incoming Slack messages to AutoQA sessions handling them.
-class Switchboard {
-    // TODO: Shut down sessions if we have too many.
-    private readonly sessions = new Map<string, SessionProxy>();
-
-    async find(key: string, ifMissing: () => Promise<SessionProxy | undefined> | SessionProxy | undefined): Promise<SessionProxy | undefined> {
-        let session = this.sessions.get(key); // Do not use getOrInsertComputed here, we may not *want* to insert if missing.
-        if (!session) {
-            session = await ifMissing();
-            if (session) {
-                this.sessions.set(key, session);
-            }
-        }
-        return session;
-    }
-
-    terminate(key: string) {
-        console.log(`terminating session ${key}`);
-        const session = this.sessions.get(key);
-        if (!session) {
-            console.log(`no session found trying to terminate ${key}`)
-            return;
-        }
-        this.sessions.delete(key);
-        session.terminate();
-    }
-}
+const operatorChannel = process.env.SLACK_OPERATOR_CHANNEL;
 
 function keyOfSlackMessage(event: Sty.SlackMessage): string {
     return `${event.channel}-${event.thread_ts || event.ts}`;
 }
 
-const storage = new ScratchStorage(os.tmpdir(), `autoqa-slack-${process.pid}`)
+function formatError(error: unknown): string {
+    if (error instanceof Error) {
+        return error.stack ?? `${error.name}: ${error.message}`;
+    }
+    return error !== undefined ? String(error) : '';
+}
+
+async function postOperatorReport(
+    client: WebClient,
+    params: {
+        channel: string;
+        threadTs: string;
+        lastEventTs: string;
+        summary: string;
+        detail?: string;
+    },
+): Promise<void> {
+    const header = `[AutoQA operator alert] ${params.summary} (channel <#${params.channel}>, thread_ts=${params.threadTs}, event_ts=${params.lastEventTs})`;
+    console.error(header, params.detail ?? '');
+    if (!operatorChannel) {
+        return;
+    }
+    const trimmedDetail = params.detail ? params.detail.slice(0, 3_000) : '';
+    const text = trimmedDetail
+        ? `${header}\n\`\`\`\n${trimmedDetail}\n\`\`\``
+        : header;
+    try {
+        await client.chat.postMessage({
+            channel: operatorChannel,
+            text,
+        });
+    } catch (error) {
+        console.error(`Failed to send operator error report to ${operatorChannel}:`, error);
+    }
+}
+
+const storage = new ScratchStorage(os.tmpdir(), `autoqa-slack-${process.pid}-`);
 const switchboard = new Switchboard();
 
 (app as any).event('message', async ({client, context, event, sayStream, setStatus}: {client: WebClient, context: Sty.SlackContext, event: Sty.SlackMessage, sayStream: Sty.SlackSayStream, setStatus: Sty.SlackSetStatus}) => {
@@ -62,41 +72,73 @@ const switchboard = new Switchboard();
     const isMentioned = event.text.indexOf(`<@${context.botUserId}>`) !== -1;
     const isBuzzOff = event.text.indexOf(`<@${context.botUserId}> bye`) !== -1;
     const key = keyOfSlackMessage(event);
+    const threadTs = event.thread_ts || event.ts;
 
     if (isBuzzOff) {
-        switchboard.terminate(key);
+        await switchboard.terminate(key);
         await client.reactions.add({
             channel: event.channel,
             timestamp: event.ts,
             name: 'wave',
         });
-        return
+        return;
     }
 
-    const session = await switchboard.find(key, isMentioned ? newSession : () => undefined);
+    const session = switchboard.find(key, isMentioned ? newSession : () => undefined);
     if (session) {
         session.onSlack(event);
     } else {
-        console.log(`ignoring message (${event.type}) - not mentioned, no existing thread`)
+        console.log(`ignoring message (${event.type}) - not mentioned, no existing thread`);
     }
 
-    async function newSession(): Promise<SessionProxy> {
+    function newSession(): SessionProxy {
         console.log(`creating new session for ${key}`);
+        let proxy!: SessionProxy;
         const slacker: Slacker = {
             sayStream,
             setStatus,
             async shareFile({filename}: {filename: string}): Promise<void> {
-                // TODO: Share success/failure of uploads back to the agent.
                 await client.filesUploadV2({
                     file: filename,
                     filename: path.basename(filename),
                     channel_id: event.channel,
-                    thread_ts: event.thread_ts || event.ts,
+                    thread_ts: threadTs,
+                });
+            },
+            async reportOperatorError({summary, detail, lastEventTs}): Promise<void> {
+                await postOperatorReport(client, {
+                    channel: event.channel,
+                    threadTs,
+                    lastEventTs,
+                    summary,
+                    detail,
+                });
+            },
+            async onWorkerDied({lastEventTs, exitCode, error}: WorkerDeathInfo): Promise<void> {
+                switchboard.deleteIfSame(key, proxy);
+                await Promise.resolve(setStatus('')).catch(() => {});
+                await client.reactions.add({
+                    channel: event.channel,
+                    timestamp: lastEventTs,
+                    name: 'dizzy_face',
+                }).catch((reactionError) => {
+                    console.error(`Failed to add dizzy_face reaction in ${key}:`, reactionError);
+                });
+                await postOperatorReport(client, {
+                    channel: event.channel,
+                    threadTs,
+                    lastEventTs,
+                    summary: `Session worker died unexpectedly (exit code ${exitCode ?? 'unknown'})`,
+                    detail: formatError(error),
                 });
             },
             botUserId: context.botUserId,
         };
-        return new SessionProxy(slacker, await storage.root());
+        proxy = new SessionProxy(slacker, storage, {
+            initialEventTs: event.ts,
+            onBeforeWake: () => switchboard.makeRoomForLiveWorker(proxy),
+        });
+        return proxy;
     }
 });
 
@@ -133,7 +175,30 @@ const switchboard = new Switchboard();
     await stream.stop();
  */
 
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+    if (shuttingDown) {
+        return;
+    }
+    shuttingDown = true;
+    console.log(`received ${signal}, shutting down autoqa-slack`);
+    try {
+        await app.stop();
+    } catch (error) {
+        console.error('Error stopping Slack Bolt app:', error);
+    }
+    await switchboard.shutdownAll();
+    await storage[Symbol.asyncDispose]();
+    process.exit(0);
+}
+
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
+
 (async () => {
+    if (!operatorChannel) {
+        console.warn('SLACK_OPERATOR_CHANNEL is not set; operator alerts will only be logged to stderr');
+    }
     await app.start();
     console.log('autoqa-slack started');
 })();

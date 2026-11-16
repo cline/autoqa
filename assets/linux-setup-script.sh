@@ -141,5 +141,5 @@ cd "$HOME"
 
 echo "starting cline in headless PTY (DISPLAY=$DISPLAY)"
 exec script --quiet --return --command \
-  "stty cols 120 rows 40; exec \"$CLINE_BIN\" --tui --auto-approve true --data-dir \"$CLINE_DATA_DIR\" -- \"Read and carry out the task and lifecycle instructions in $prompt_path\"" \
+  "stty cols 120 rows 40; exec \"$CLINE_BIN\" --tui --model anthropic/claude-opus-5.5 --auto-approve true --data-dir \"$CLINE_DATA_DIR\" -- \"Read and carry out the task and lifecycle instructions in $prompt_path\"" \
   "$CONTROL_TOWER_JOB_ROOT/tui.log" >/dev/null
