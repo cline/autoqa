@@ -1,18 +1,28 @@
 import * as fs from "node:fs/promises"
 import { readFileSync } from 'node:fs';
+import {randomUUID} from 'node:crypto';
 import * as path from "node:path"
 
-import {Agent, type AgentRunResult} from '@cline/agents';
+import {Agent, type AgentModel, type AgentRunResult} from '@cline/agents';
 import {createContextCompactionPrepareTurn, createDefaultExecutors, createDefaultTools, ProviderSettingsManager, type ToolExecutors, resolveProviderApiKeyFromSettings } from "@cline/core";
+import {createTool, type AgentTool} from '@cline/sdk';
 
 import {ControlTower, type JobConfigurations} from './control-tower.ts';
 import {createGitHubGraphqlTool} from "./github.ts";
 import type {ScratchStorage} from "../common/scratch-storage.ts";
-import type {PersistedSessionState} from "../common/types.ts";
+import type {JournalClient} from "../common/session-journal.ts";
+import {
+    CURRENT_TOOL_SCHEMA_VERSION,
+    JOURNAL_FORMAT_VERSION,
+    type HoldState,
+    type SessionJournalRecord,
+} from "../common/types.ts";
 import {Curator} from "./artifacts.ts";
 
 export const DEFAULT_MODEL_ID = process.env.AUTOQA_MODEL_ID || 'anthropic/claude-opus-5.5';
-const SESSION_STATE_FILENAME = '.session-state.json';
+const MIN_HOLD_SECONDS = 5;
+const MAX_HOLD_SECONDS = 300;
+const DEFAULT_HOLD_SECONDS = 60;
 
 function readAssetUtf8(name: string): string {
     // assets/ sits two levels above this file, both in src/chat/ and in dist/chat/.
@@ -103,8 +113,10 @@ nvm install 24
 });
 
 export interface Slacker {
-    uploadFile(filename: string): void,
-    botUserId: string,
+    uploadFile(filename: string): void;
+    watchJob?(jobId: string, initialStatus?: string): void;
+    unwatchJob?(jobId: string): void;
+    botUserId: string;
 }
 
 type FileReadExecutor = NonNullable<ToolExecutors["readFile"]>
@@ -138,28 +150,23 @@ export function createRootedReadExecutor(
     }
 }
 
-async function loadSessionState(storage: ScratchStorage): Promise<PersistedSessionState | undefined> {
-    const filePath = await storage.checked(SESSION_STATE_FILENAME);
-    try {
-        const raw = await fs.readFile(filePath, 'utf8');
-        const parsed = JSON.parse(raw) as PersistedSessionState;
-        if (parsed && parsed.version === 1 && Array.isArray(parsed.messages)) {
-            return parsed;
-        }
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-            console.error(`Failed to read persisted session state at ${filePath}:`, error);
-        }
-    }
-    return undefined;
+interface PendingHoldRequest {
+    delayMs: number;
+    reason?: string;
+    mustSpeakToUser: boolean;
 }
 
-let saveCounter = 0;
-async function saveSessionState(storage: ScratchStorage, state: PersistedSessionState): Promise<void> {
-    const filePath = await storage.checked(SESSION_STATE_FILENAME);
-    const tmpPath = await storage.checked(`${SESSION_STATE_FILENAME}.${++saveCounter}.tmp`);
-    await fs.writeFile(tmpPath, JSON.stringify(state), 'utf8');
-    await fs.rename(tmpPath, filePath);
+function buildSchemaMigrationNotice(fromVersion: number, toVersion: number): string {
+    return (
+        `<system_migration_notice>\n` +
+        `This conversation was resumed across an AutoQA update (tool schema v${fromVersion} -> v${toVersion}). ` +
+        `Your available tools and conventions have changed:\n` +
+        `- Use the \`hold\` tool when you want to wait (default 60s) for a teammate to finish sending follow-up context; ` +
+        `you may either stay silent (\`hold\` + reply \`GOTCHA\`) or send a visible question/message alongside \`hold\`.\n` +
+        `- \`submit_qa_job\` automatically watches submitted jobs via the centralized watcher.\n` +
+        `Follow your current system prompt and tool definitions rather than imitating older tool calls in the transcript above.\n` +
+        `</system_migration_notice>`
+    );
 }
 
 export class QAAgent {
@@ -167,51 +174,71 @@ export class QAAgent {
     private readonly slacker: Slacker;
     private readonly notify: (message: string) => void;
     private readonly onActivityChange: (() => void) | undefined;
-    private restoredExtraFields: Record<string, unknown> = {};
+    private readonly modelOverride: AgentModel | undefined;
+    private readonly journal: JournalClient;
     private agent: Agent | undefined;
     private curator: Curator | undefined;
-    private controlTower: ControlTower | undefined;
+    private readonly persistedMessageIds = new Set<string>();
+    private persistedMessageOrder: string[] = [];
+    private holdState: HoldState = { consecutiveHolds: 0, lastHoldWasSilent: false };
+    private pendingHold: PendingHoldRequest | undefined;
+    private pendingMigrationFromVersion: number | undefined;
 
     constructor(
         storage: ScratchStorage,
         notify: (message: string) => void,
         slacker: Slacker,
-        options: { onActivityChange?: () => void } = {},
+        options: { onActivityChange?: () => void; model?: AgentModel; journal: JournalClient },
     ) {
         this.storage = storage;
         this.notify = notify;
         this.slacker = slacker;
         this.onActivityChange = options.onActivityChange;
+        this.modelOverride = options.model;
+        this.journal = options.journal;
     }
 
-    async start(): Promise<{ messageCount: number }> {
-        const restored = await loadSessionState(this.storage);
-        if (restored) {
-            const { version: _v, messages: _m, messageCount: _c, watchedJobs: _w, fetchedArtifacts: _f, ...extra } = restored;
-            this.restoredExtraFields = extra;
+    async start(): Promise<void> {
+        const rootPath = await this.storage.root();
+        const journal = this.journal;
+        const replayed = await journal.replay();
+        for (const message of replayed.messages) this.persistedMessageIds.add(message.id);
+        this.persistedMessageOrder = replayed.messages.map((message) => message.id);
+        this.holdState = { ...replayed.holdState };
+
+        if (replayed.hasRecords && replayed.messages.length > 0 && replayed.toolSchemaVersion < CURRENT_TOOL_SCHEMA_VERSION) {
+            this.pendingMigrationFromVersion = replayed.toolSchemaVersion;
         }
         const providerSettingsManager = new ProviderSettingsManager();
         const resolvedApiKey = resolveProviderApiKeyFromSettings(providerSettingsManager, "cline") || process.env.CLINE_API_KEY;
         const modelId = DEFAULT_MODEL_ID;
         const curator = new Curator(this.storage, this.notify, this.slacker, {
-            initialArtifacts: restored?.fetchedArtifacts,
+            initialArtifacts: replayed.fetchedArtifacts.entries(),
             onActivityChange: this.onActivityChange,
+            onArtifactFetched: (jobId, relativePath) => {
+                return journal.append({
+                    v: JOURNAL_FORMAT_VERSION,
+                    ts: Date.now(),
+                    type: 'artifact',
+                    jobId,
+                    relativePath,
+                });
+            },
         });
-        const controlTower = new ControlTower(this.notify, {
-            baseUrl: controlTowerBaseUrl(),     // tunnel now, co-located later; same URL either way
+        const controlTower = new ControlTower({
+            baseUrl: controlTowerBaseUrl(),
             jobConfigurations,
-            initialWatchedJobs: restored?.watchedJobs,
-            onActivityChange: this.onActivityChange,
+            onWatchJob: (jobId, initialStatus) => this.slacker.watchJob?.(jobId, initialStatus),
+            onUnwatchJob: (jobId) => this.slacker.unwatchJob?.(jobId),
         });
         this.curator = curator;
-        this.controlTower = controlTower;
         const botUserId = this.slacker.botUserId;
 
         const defaultTools = createDefaultTools({
             executors: {
-                readFile: createRootedReadExecutor(await this.storage.root()),
+                readFile: createRootedReadExecutor(rootPath),
             },
-            fileReadTimeoutMs: 10_000, // optional; this is the default
+            fileReadTimeoutMs: 10_000,
         });
         if (defaultTools.length !== 1) {
             console.error(`${defaultTools.length} default tools`);
@@ -228,11 +255,8 @@ export class QAAgent {
             },
         });
 
-        this.agent = new Agent({
-            providerId: 'cline',
-            apiKey: resolvedApiKey,
-            modelId,
-            initialMessages: restored?.messages,
+        const sharedAgentConfig = {
+            initialMessages: replayed.messages,
             prepareTurn: compactTurn
                 ? async (ctx) => compactTurn({
                     agentId: ctx.agentId,
@@ -265,9 +289,9 @@ Cline team members while the container is working, and present the results in a 
 
 There are some limitations on WHAT we can test right now:
 
-- You, AutoQA bot, may completely lose context your server is restarted. If you don't know
-  what the user is talking about, politely explain you probably restarted, ask them for a
-  Job ID, and pick up from there.
+- Conversation history and job watches survive server restarts. A turn interrupted by a
+  crash may be incomplete; check job state before repeating a submission. Hold timers are
+  cancelled by a server restart; only an explicit new hold arms another timer.
 - Spinning up instances can take a minutes.
 - There's no realtime screen sharing or direct clicking or typing by YOU or the Cline team
   member. You hand the tasks off to the computer use agent, can do some minimal monitoring
@@ -365,8 +389,14 @@ targets in the next message.
   a bare mention, "one sec", "let me grab the PR", or a half-finished thought), or if key facts
   needed for a meaningful test are missing and cannot be looked up with \`github_graphql\` (which
   issue, PR, surface, or behavior to check).
-- When context looks incomplete, acknowledge briefly or ask one direct, open question first.
-  Start the VM once you know what to test and what outcome to verify.
+- When you suspect the teammate is still typing or preparing follow-up details, use the \`hold\`
+  tool (opt-in, default 60 seconds; do NOT use \`hold\` on clear, self-contained requests):
+  - To wait silently without interrupting their typing, call \`hold\` and reply \`GOTCHA\`.
+  - To ask a quick question or acknowledge while still checking back if they go quiet, call \`hold\`
+    AND send your normal visible Slack reply.
+  - If a silent \`hold\` expires with no new message, you may ask a concise follow-up question and
+    call \`hold\` one more time; if that second hold also expires with no reply, act with your best
+    judgment or finish without holding again.
 - \`submit_qa_job\` automatically watches the job and sends you notifications as its phase changes
   and when it finishes. Do not poll \`list_qa_jobs\` in a loop while waiting.
 
@@ -447,37 +477,179 @@ ${Object.entries(jobConfigurations).map(([key, config]) => '## ' + key + '\n' + 
                 createGitHubGraphqlTool({token: process.env.GITHUB_TOKEN ?? ''}),
                 ...controlTower.createTools(),
                 ...curator.createTools(),
+                this.createHoldTool(),
             ],
-        });
+        };
 
-        return { messageCount: restored?.messageCount ?? 0 };
+        this.agent = this.modelOverride
+            ? new Agent({
+                ...sharedAgentConfig,
+                model: this.modelOverride,
+            })
+            : new Agent({
+                ...sharedAgentConfig,
+                providerId: 'cline',
+                apiKey: resolvedApiKey,
+                modelId,
+            });
+
+    }
+
+    private createHoldTool(): AgentTool {
+        return createTool<{ seconds?: number; reason?: string }, string>({
+            name: 'hold',
+            description:
+                'Opt-in timer that wakes you back up after `seconds` (default 60, range 5-300) if no ' +
+                'teammate posts a follow-up Slack message first. Any new Slack message in the thread ' +
+                'cancels the timer immediately. You can either hold silently (call `hold` and reply ' +
+                '`GOTCHA`) or send a visible reply/question AND call `hold` to check back if nobody ' +
+                'answers. Do not use `hold` on clear, complete requests.',
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    seconds: {
+                        type: 'number',
+                        description: 'Seconds to wait before waking up if no human replies (default 60, clamped to 5..300).',
+                    },
+                    reason: {
+                        type: 'string',
+                        description: 'Brief note reminding yourself what you were waiting for when the timer fires.',
+                    },
+                },
+                additionalProperties: false,
+            },
+            execute: async ({ seconds, reason }) => {
+                if (this.pendingHold) {
+                    return 'A hold timer is already scheduled for this turn.';
+                }
+                if (this.holdState.consecutiveHolds >= 2) {
+                    return (
+                        'Hold refused: you have already held twice in a row without any new human message. ' +
+                        'Proceed with your best judgment now, or reply GOTCHA to stay quiet until someone speaks.'
+                    );
+                }
+                const clampedSeconds = Math.max(
+                    MIN_HOLD_SECONDS,
+                    Math.min(MAX_HOLD_SECONDS, Math.round(seconds ?? DEFAULT_HOLD_SECONDS)),
+                );
+                const mustSpeakToUser =
+                    this.holdState.consecutiveHolds === 1 && this.holdState.lastHoldWasSilent;
+                this.pendingHold = {
+                    delayMs: clampedSeconds * 1000,
+                    reason,
+                    mustSpeakToUser,
+                };
+                if (mustSpeakToUser) {
+                    return (
+                        `Hold timer armed for ${clampedSeconds}s. Because your previous hold was silent and no ` +
+                        `follow-up arrived, you MUST send a visible message/question to the thread in this turn ` +
+                        `(do not reply GOTCHA, or this second hold will be skipped).`
+                    );
+                }
+                return (
+                    `Hold timer armed for ${clampedSeconds}s. Reply GOTCHA to wait silently, or write a visible ` +
+                    `message to speak now and still wake up in ${clampedSeconds}s if nobody replies.`
+                );
+            },
+        });
     }
 
     hasActiveBackgroundWork(): boolean {
-        return Boolean(this.controlTower?.hasWatchedJobs() || this.curator?.hasActiveFetches());
+        return Boolean(this.curator?.hasActiveFetches());
     }
 
-    async saveState(messageCount: number): Promise<void> {
-        if (!this.agent) {
-            return;
+    async recordHumanMessage(): Promise<void> {
+        if (this.holdState.consecutiveHolds !== 0 || this.holdState.lastHoldWasSilent) {
+            await this.journal.append({
+                v: JOURNAL_FORMAT_VERSION,
+                ts: Date.now(),
+                type: 'hold_state',
+                consecutiveHolds: 0,
+                lastHoldWasSilent: false,
+            });
+            this.holdState = { consecutiveHolds: 0, lastHoldWasSilent: false };
         }
-        await saveSessionState(this.storage, {
-            ...this.restoredExtraFields,
-            version: 1,
-            messages: [...this.agent.snapshot().messages],
-            messageCount,
-            watchedJobs: this.controlTower?.getWatchedJobs() ?? [],
-            fetchedArtifacts: this.curator?.getFetchedArtifacts() ?? [],
-        });
     }
 
-    dispose(): void {
-        this.controlTower?.dispose();
+    async finalizeTurn(sentVisibleReply: boolean, inputIds: readonly string[] = []): Promise<PendingHoldRequest | undefined> {
+        const records: SessionJournalRecord[] = [];
+        const now = Date.now();
+        for (const id of inputIds) records.push({v: 1, ts: now, type: 'input_processed', id});
+        const currentMessages = this.agent?.snapshot().messages ?? [];
+        const newMessages = currentMessages.filter((message) => !this.persistedMessageIds.has(message.id));
+
+        for (const message of newMessages) {
+            records.push({
+                v: JOURNAL_FORMAT_VERSION,
+                ts: now,
+                type: 'message',
+                message,
+            });
+        }
+        // Compaction can replace or shorten history. Preserve its active ordering without rewriting old records.
+        if (!this.persistedMessageOrder.every((id, index) => currentMessages[index]?.id === id)) {
+            records.push({v: 1, ts: now, type: 'message_order', ids: currentMessages.map((message) => message.id)});
+        }
+
+        const requestedHold = this.pendingHold;
+        let effectiveHold: PendingHoldRequest | undefined;
+        let nextHoldState = this.holdState;
+
+        if (requestedHold) {
+            if (requestedHold.mustSpeakToUser && !sentVisibleReply) {
+                effectiveHold = undefined;
+            } else {
+                effectiveHold = requestedHold;
+                nextHoldState = {
+                    consecutiveHolds: this.holdState.consecutiveHolds + 1,
+                    lastHoldWasSilent: !sentVisibleReply,
+                };
+                records.push({
+                    v: JOURNAL_FORMAT_VERSION,
+                    ts: now,
+                    type: 'hold_state',
+                    consecutiveHolds: nextHoldState.consecutiveHolds,
+                    lastHoldWasSilent: nextHoldState.lastHoldWasSilent,
+                });
+            }
+        }
+
+        if (records.length > 0) {
+            await this.journal.append(records);
+        } else {
+            await this.journal.flush();
+        }
+        for (const message of newMessages) this.persistedMessageIds.add(message.id);
+        this.persistedMessageOrder = currentMessages.map((message) => message.id);
+        this.holdState = nextHoldState;
+        this.pendingHold = undefined;
+        return effectiveHold;
+    }
+
+    async flushJournal(): Promise<void> {
+        await this.journal.flush();
     }
 
     async process(message: string): Promise<AgentRunResult> {
         if (!this.agent) {
             throw new Error('invalid state, call start() first');
+        }
+        this.pendingHold = undefined;
+        if (this.pendingMigrationFromVersion !== undefined) {
+            const notice = {
+                id: randomUUID(), role: 'user' as const,
+                content: [{type: 'text' as const, text: buildSchemaMigrationNotice(this.pendingMigrationFromVersion, CURRENT_TOOL_SCHEMA_VERSION)}],
+                createdAt: Date.now(),
+            };
+            // The marker and its context share one durable append before the model can run.
+            await this.journal.append([
+                {v: 1, ts: notice.createdAt, type: 'message', message: notice},
+                {v: 1, ts: notice.createdAt, type: 'schema_migrated', fromToolSchemaVersion: this.pendingMigrationFromVersion, toToolSchemaVersion: CURRENT_TOOL_SCHEMA_VERSION},
+            ]);
+            this.agent.restore([...this.agent.snapshot().messages, notice]);
+            this.persistedMessageIds.add(notice.id);
+            this.persistedMessageOrder.push(notice.id);
+            this.pendingMigrationFromVersion = undefined;
         }
         return await this.agent.run(message);
     }

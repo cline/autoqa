@@ -6,6 +6,7 @@ import {QAAgent} from './agent.ts';
 import {Joinery} from '../join.ts';
 import type {SetStatusFn} from "@slack/bolt";
 import {ScratchStorage} from "../common/scratch-storage.ts";
+import {RemoteSessionJournal} from '../common/session-journal.ts';
 import type {MainToWorkerMessage, WorkerBootstrapData, WorkerToMainMessage} from "../common/types.ts";
 import type {SlackMessage} from "../slack-types.ts";
 
@@ -17,6 +18,7 @@ if (isMainThread) {
 const boot = workerData as WorkerBootstrapData;
 const port = boot.port;
 const storage = ScratchStorage.existing(boot.storagePath);
+const journal = new RemoteSessionJournal(port);
 
 function postToMain(message: WorkerToMainMessage): void {
     port.postMessage(message);
@@ -37,18 +39,19 @@ class ChatterImpl {
             summary: `Unhandled Joinery error in worker ${threadId}`,
             detail: formatError(error),
         });
+        // Leave the input pending if a pre-run operation fails before the SDK can record it.
+        process.exit(1);
     });
-    private readonly _slack = this.j.m<SlackMessage>();
+    private readonly _slack = this.j.m<{event: SlackMessage; inputId?: string}>();
     private readonly _hibernate = this.j.m<void>();
-    private readonly _agentDone = this.j.m<{agent: QAAgent, result: AgentRunResult}>();
+    private readonly _agentDone = this.j.m<{agent: QAAgent, result: AgentRunResult; inputIds: string[]}>();
     private readonly _agentIdle = this.j.m<QAAgent>();
-    private readonly _notify = this.j.m<string>();
-    private readonly _pendingNotifications = this.j.m<string[]>();
+    private readonly _notify = this.j.m<{message: string; inputId?: string}>();
+    private readonly _pendingNotifications = this.j.m<{message: string; inputId?: string}[]>();
     private readonly _noPendingNotifications = this.j.m<void>();
-    private readonly _state = this.j.m<{messageCount: number}>();
     private isBusy = false;
     private statusActive = false;
-    private latestMessageCount = 0;
+    private lastEventTs = boot.lastEventTs ?? '';
 
     constructor() {
         // 1-2. Coalesce incoming tool notifications whether or not notifications are already queued.
@@ -60,52 +63,63 @@ class ChatterImpl {
             this._pendingNotifications([...messages, message]);
         });
 
-        let saveChain = Promise.resolve();
-        const enqueueSave = () => {
-            const countSnapshot = this.latestMessageCount;
-            saveChain = saveChain
-                .then(() => agent.saveState(countSnapshot))
-                .catch((err) => {
-                    console.error(`worker ${threadId} session state save failed:`, err);
-                    postToMain({
-                        type: 'operator-error',
-                        summary: `Failed to persist session state in worker ${threadId}`,
-                        detail: formatError(err),
-                    });
-                });
-            return saveChain;
-        };
-
-        // 3. Complete an agent turn, persist state, and release _agentIdle.
-        this.j.on([this._agentDone, this._state], async ({agent: completedAgent, result}, state) => {
+        // 3. Complete an agent turn, append new messages/hold state to session.jsonl, and release _agentIdle.
+        this.j.on([this._agentDone], async ({agent: completedAgent, result, inputIds}) => {
             console.log('agent-done');
-            this.isBusy = false;
-            this.latestMessageCount = state.messageCount;
             if (this.statusActive) {
                 this.statusActive = false;
                 this.setStatus('');
             }
-            await enqueueSave();
+            const trimmed = result.status === 'completed' ? result.outputText.trim() : '';
+            const sentVisibleReply =
+                result.status !== 'completed' || (trimmed !== 'GOTCHA' && trimmed !== '');
+            try {
+                const effectiveHold = await completedAgent.finalizeTurn(sentVisibleReply, inputIds);
+                for (const inputId of inputIds) postToMain({type: 'input-complete', inputId});
+                if (effectiveHold) {
+                    postToMain({
+                        type: 'hold',
+                        delayMs: effectiveHold.delayMs,
+                        reason: effectiveHold.reason,
+                        lastEventTs: this.lastEventTs,
+                    });
+                }
+            } catch (err) {
+                console.error(`worker ${threadId} session journal append failed:`, err);
+                postToMain({
+                    type: 'operator-error',
+                    summary: `Failed to append turn to session journal in worker ${threadId}`,
+                    detail: formatError(err),
+                });
+                // Do not run another turn or acknowledge hibernation after an uncommitted transcript.
+                // Main retains the durable input and can replay it in a fresh worker.
+                process.exit(1);
+            }
+            this.isBusy = false;
             this.reportActivity(false, completedAgent.hasActiveBackgroundWork());
-            this._state(state);
             this._agentIdle(completedAgent);
             console.log(`worker ${threadId}: ${JSON.stringify(result, null, 2)}`);
             this.agentMessageToSlack(result);
         });
 
         // 4. Human Slack messages claim _agentIdle ahead of background notifications.
-        this.j.on([this._slack, this._agentIdle, this._state], async (event, agent, {messageCount}) => {
+        this.j.on([this._slack, this._agentIdle], async ({event, inputId}, agent) => {
             console.log('slack+agent-idle');
-            const nextCount = messageCount + 1;
-            this.latestMessageCount = nextCount;
+            this.lastEventTs = event.ts;
             this.isBusy = true;
             this.statusActive = true;
             this.setStatus('processing');
             this.reportActivity(true, agent.hasActiveBackgroundWork());
-            this._state({messageCount: nextCount});
 
-            const result = await this.safeProcess(agent, this.slackToAgentMessageText(event));
-            this._agentDone({agent, result});
+            try {
+                await agent.recordHumanMessage();
+            } catch (err) {
+                console.error(`worker ${threadId} failed to record human message in journal:`, err);
+                postToMain({type: 'operator-error', summary: 'Failed to persist human input state', detail: formatError(err)});
+                process.exit(1);
+            }
+            const result = await agent.process(this.slackToAgentMessageText(event));
+            this._agentDone({agent, result, inputIds: inputId ? [inputId] : []});
         });
 
         // 5. Background notifications run when _agentIdle is free and no human message is waiting.
@@ -113,31 +127,33 @@ class ChatterImpl {
             this._noPendingNotifications();
             this.isBusy = true;
             this.reportActivity(true, agent.hasActiveBackgroundWork());
-            const result = await this.safeProcess(
-                agent,
-                `Notifications:\n${messages.join('\n')}\n\nThese were generated by tools. The humans cannot see these unless you want to tell them. If you send a reply, it will be sent to humans; if you don't want to bother the humans, just reply with GOTCHA`,
+            const result = await agent.process(
+                `Notifications:\n${messages.map((entry) => entry.message).join('\n')}\n\nThese were generated by tools. The humans cannot see these unless you want to tell them. If you send a reply, it will be sent to humans; if you don't want to bother the humans, just reply with GOTCHA`,
             );
-            this._agentDone({agent, result});
+            this._agentDone({agent, result, inputIds: messages.flatMap((entry) => entry.inputId ? [entry.inputId] : [])});
         });
 
-        // 6. Hibernate only when idle with no pending Slack messages, notifications, or active watches/fetches.
-        this.j.on([this._hibernate, this._agentIdle, this._noPendingNotifications, this._state], async (_, idleAgent, __, state) => {
+        // 6. Hibernate only when idle with no pending Slack messages, notifications, or active artifact fetches.
+        this.j.on([this._hibernate, this._agentIdle, this._noPendingNotifications], async (_, idleAgent) => {
             if (idleAgent.hasActiveBackgroundWork()) {
                 this.reportActivity(false, true);
-                this._state(state);
+                postToMain({type: 'hibernate-declined'});
                 this._noPendingNotifications();
                 this._agentIdle(idleAgent);
                 return;
             }
-            this.latestMessageCount = state.messageCount;
-            await enqueueSave();
-            idleAgent.dispose();
+            try {
+                await idleAgent.flushJournal();
+            } catch (err) {
+                console.error(`worker ${threadId} failed to flush journal before hibernate:`, err);
+                process.exit(1);
+            }
             postToMain({type: 'hibernated'});
         });
 
         const agent = new QAAgent(
             storage,
-            this._notify,
+            (message) => postToMain({type: 'notify', message}),
             {
                 uploadFile(filename: string): void {
                     console.log(`W->M upload-file ${filename}`);
@@ -146,24 +162,32 @@ class ChatterImpl {
                         filename,
                     });
                 },
+                watchJob(jobId: string, initialStatus?: string): void {
+                    postToMain({
+                        type: 'watch-job',
+                        jobId,
+                        initialStatus,
+                    });
+                },
+                unwatchJob(jobId: string): void {
+                    postToMain({
+                        type: 'unwatch-job',
+                        jobId,
+                    });
+                },
                 botUserId: boot.botUserId,
             },
             {
+                journal,
                 onActivityChange: () => {
-                    const hasBg = agent.hasActiveBackgroundWork();
-                    this.reportActivity(this.isBusy, hasBg);
-                    if (!this.isBusy) {
-                        void enqueueSave();
-                    }
+                    this.reportActivity(this.isBusy, agent.hasActiveBackgroundWork());
                 },
             },
         );
 
         this._noPendingNotifications();
         agent.start()
-            .then(({messageCount}) => {
-                this.latestMessageCount = messageCount;
-                this._state({messageCount});
+            .then(() => {
                 this.reportActivity(false, agent.hasActiveBackgroundWork());
                 this._agentIdle(agent);
             })
@@ -179,34 +203,8 @@ class ChatterImpl {
     }
 
     get slack() { return this._slack; }
+    get notify() { return this._notify; }
     get hibernate() { return this._hibernate; }
-
-    private async safeProcess(agent: QAAgent, text: string): Promise<AgentRunResult> {
-        try {
-            return await agent.process(text);
-        } catch (error) {
-            const detail = formatError(error);
-            console.error(`worker ${threadId} agent.process error:`, detail);
-            postToMain({
-                type: 'operator-error',
-                summary: `agent.process threw in worker ${threadId}`,
-                detail,
-            });
-            return {
-                status: 'failed',
-                outputText: '',
-                error: detail,
-                iterations: 0,
-                messages: [],
-                usage: {
-                    inputTokens: 0,
-                    outputTokens: 0,
-                    cacheReadTokens: 0,
-                    cacheWriteTokens: 0,
-                },
-            } as unknown as AgentRunResult;
-        }
-    }
 
     private reportActivity(busy: boolean, activeBackgroundWork: boolean): void {
         postToMain({
@@ -262,7 +260,9 @@ port.on('message', (event: MainToWorkerMessage) => {
     console.log(`M->W ${JSON.stringify(event, null, 2)}`);
     if (event && typeof event === 'object' && 'type' in event) {
         if (event.type === 'slack') {
-            chatter.slack(event.event);
+            chatter.slack({event: event.event, inputId: event.inputId});
+        } else if (event.type === 'notify') {
+            chatter.notify({message: event.message, inputId: event.inputId});
         } else if (event.type === 'hibernate') {
             chatter.hibernate();
         }
