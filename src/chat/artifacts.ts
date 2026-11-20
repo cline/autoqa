@@ -17,6 +17,7 @@ export interface CuratorOptions {
     fetchTimeoutMs?: number;
     initialArtifacts?: Iterable<[string, string]>;
     onActivityChange?: () => void;
+    onArtifactFetched?: (jobId: string, relativePath: string) => void | Promise<void>;
     fetch?: typeof fetch;
 }
 
@@ -29,6 +30,7 @@ export class Curator {
     private readonly baseUrl: string;
     private readonly fetchTimeoutMs: number;
     private readonly onActivityChange: (() => void) | undefined;
+    private readonly onArtifactFetched: CuratorOptions['onArtifactFetched'];
     private readonly doFetch: typeof fetch;
     private activeFetches = 0;
 
@@ -42,6 +44,7 @@ export class Curator {
         this.baseUrl = options.baseUrl ?? controlTowerBaseUrl();
         this.fetchTimeoutMs = options.fetchTimeoutMs ?? 5 * 60 * 1000;
         this.onActivityChange = options.onActivityChange;
+        this.onArtifactFetched = options.onArtifactFetched;
         this.doFetch = options.fetch ?? fetch;
         if (options.initialArtifacts) {
             for (const [jobId, relPath] of options.initialArtifacts) {
@@ -52,16 +55,6 @@ export class Curator {
 
     public hasActiveFetches(): boolean {
         return this.activeFetches > 0;
-    }
-
-    public getFetchedArtifacts(): [string, string][] {
-        const resolved: [string, string][] = [];
-        for (const [jobId, entry] of this.corpus.entries()) {
-            if (typeof entry === 'string') {
-                resolved.push([jobId, entry]);
-            }
-        }
-        return resolved;
     }
 
     public createTools(): AgentTool[] {
@@ -91,6 +84,7 @@ export class Curator {
                         try {
                             const fetchedPath = await fetchPromise;
                             this.corpus.set(jobId, fetchedPath);
+                            await this.onArtifactFetched?.(jobId, fetchedPath);
                             this.onActivityChange?.();
                             this.notify(`Fetching job ${jobId} completed; artifacts are available at ${fetchedPath}`);
                         } catch (error) {

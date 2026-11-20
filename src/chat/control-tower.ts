@@ -24,14 +24,26 @@ export interface ControlTowerOptions {
     source?: string;
     /** Control Tower serializes work behind one lock, so allow more than request_timeout_secs. */
     timeoutMs?: number;
-    /** Poll cadence while jobs are watched. Status updates only fire when describe(job) changes. */
-    pollIntervalMs?: number;
-    /** Restored watched job snapshots ([jobId, serializedDescription]) when waking a hibernated worker. */
-    initialWatchedJobs?: Iterable<[string, string]>;
-    /** Invoked whenever the watched-job set transitions between empty and non-empty, or updates. */
-    onActivityChange?: () => void;
+    /** Delegates job watching to the centralized main-process ControlTowerWatcher. */
+    onWatchJob?: (jobId: string, initialStatus?: string) => void;
+    /** Delegates job unwatching to the centralized main-process ControlTowerWatcher. */
+    onUnwatchJob?: (jobId: string) => void;
     fetch?: typeof fetch;
 }
+
+export interface ControlTowerWatcherOptions {
+    baseUrl?: string;
+    timeoutMs?: number;
+    /** Poll cadence while at least one session watches a job. */
+    pollIntervalMs?: number;
+    fetch?: typeof fetch;
+    /** Resolves when a session update has been durably accepted, before its watch cursor advances. */
+    onSessionUpdate: (sessionKey: string, notificationText: string, updates: readonly SessionWatchDelta[]) => Promise<void> | void;
+}
+
+export type SessionWatchDelta =
+    | { kind: 'watch'; jobId: string; status: string }
+    | { kind: 'unwatch'; jobId: string };
 
 type Outcome = 'completed' | 'failed' | 'cancelled' | 'lost' | 'timed_out';
 interface Phase { kind: string; phase?: Phase; failures?: number }
@@ -49,30 +61,26 @@ interface Job {
 }
 interface JobList { jobs: Job[] }
 
-export class ControlTower {
-    private readonly notify: (message: string) => void;
-    private readonly watchedJobs = new Map<string, string>();
+// Centralized main-process job watcher: polls GET /api/jobs once per interval across all sessions,
+// deduplicating shared job watches and waking hibernated sessions only when describe(job) changes.
+export class ControlTowerWatcher {
+    private readonly subscriptions = new Map<string, Map<string, { status: string }>>();
+    private disposed = false;
     private watcherInterval: NodeJS.Timeout | undefined;
     private readonly pollIntervalMs: number;
-    private readonly onActivityChange: (() => void) | undefined;
     private readonly client: ReturnType<typeof createClient>;
-    private readonly configurationOptions: {jobConfigurations: JobConfigurations};
+    private readonly onSessionUpdate: ControlTowerWatcherOptions['onSessionUpdate'];
     private readonly pollJoinery = new Joinery((error) => {
-        console.error('ControlTower poll joinery error:', error);
+        console.error('ControlTowerWatcher poll joinery error:', error);
     });
     private readonly pollIdle = this.pollJoinery.m<void>();
     private readonly pollRequested = this.pollJoinery.m<void>();
 
-    constructor(notify: (message: string) => void, options: ControlTowerOptions) {
-        this.notify = notify;
+    constructor(options: ControlTowerWatcherOptions) {
         this.client = createClient(options);
         this.pollIntervalMs = options.pollIntervalMs ?? 30_000;
-        this.onActivityChange = options.onActivityChange;
-        this.configurationOptions = {
-            jobConfigurations: options.jobConfigurations,
-        };
+        this.onSessionUpdate = options.onSessionUpdate;
 
-        // Serialize polls through Joinery so timer ticks and immediate watch checks never overlap.
         this.pollJoinery.on([this.pollIdle, this.pollRequested], async () => {
             try {
                 await this.fetchWatchedJobs();
@@ -81,122 +89,220 @@ export class ControlTower {
             }
         });
         this.pollIdle();
+    }
 
-        if (options.initialWatchedJobs) {
-            for (const [jobId, status] of options.initialWatchedJobs) {
-                this.watchedJobs.set(jobId, status);
-            }
-            if (this.watchedJobs.size > 0) {
-                this.ensureWatcherRunning();
-                this.pollRequested();
+    public watch(sessionKey: string, jobId: string, initialStatus?: string): boolean {
+        if (this.disposed) return false;
+        let perSession = this.subscriptions.get(jobId);
+        if (!perSession) {
+            perSession = new Map();
+            this.subscriptions.set(jobId, perSession);
+        }
+        const isNew = !perSession.has(sessionKey);
+        if (initialStatus !== undefined || isNew) {
+            perSession.set(sessionKey, { status: initialStatus ?? '' });
+        }
+        this.ensureRunning();
+        if (initialStatus === undefined) {
+            this.pollRequested();
+        }
+        return isNew || initialStatus !== undefined;
+    }
+
+    public unwatch(sessionKey: string, jobId: string): boolean {
+        const perSession = this.subscriptions.get(jobId);
+        if (!perSession) {
+            return false;
+        }
+        const deleted = perSession.delete(sessionKey);
+        if (perSession.size === 0) {
+            this.subscriptions.delete(jobId);
+        }
+        this.stopIfEmpty();
+        return deleted;
+    }
+
+    public removeSession(sessionKey: string): void {
+        for (const [jobId, perSession] of this.subscriptions.entries()) {
+            perSession.delete(sessionKey);
+            if (perSession.size === 0) {
+                this.subscriptions.delete(jobId);
             }
         }
+        this.stopIfEmpty();
     }
 
-    public hasWatchedJobs(): boolean {
-        return this.watchedJobs.size > 0;
+    public hasWatchesForSession(sessionKey: string): boolean {
+        for (const perSession of this.subscriptions.values()) {
+            if (perSession.has(sessionKey)) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    public getWatchedJobs(): [string, string][] {
-        return Array.from(this.watchedJobs.entries());
+    public watchedJobCount(): number {
+        return this.subscriptions.size;
     }
 
     public dispose(): void {
+        this.disposed = true;
         if (this.watcherInterval) {
             clearInterval(this.watcherInterval);
             this.watcherInterval = undefined;
         }
+        this.subscriptions.clear();
     }
 
-    private ensureWatcherRunning(): void {
-        if (!this.watcherInterval) {
-            console.log('starting to watch jobs');
+    private ensureRunning(): void {
+        if (!this.watcherInterval && this.subscriptions.size > 0) {
+            console.log('starting centralized job watcher');
             this.watcherInterval = setInterval(() => this.pollRequested(), this.pollIntervalMs);
+            this.watcherInterval.unref();
         }
     }
 
-    private stopWatcherIfEmpty(): void {
-        if (this.watchedJobs.size === 0 && this.watcherInterval) {
+    private stopIfEmpty(): void {
+        if (this.subscriptions.size === 0 && this.watcherInterval) {
             console.log('no jobs left to watch');
             clearInterval(this.watcherInterval);
             this.watcherInterval = undefined;
         }
     }
 
-    private watch(jobId: string, initialStatus?: string): void {
-        const isNew = !this.watchedJobs.has(jobId);
-        if (initialStatus !== undefined || isNew) {
-            this.watchedJobs.set(jobId, initialStatus ?? '');
-        }
-        this.ensureWatcherRunning();
-        this.onActivityChange?.();
-        if (initialStatus === undefined) {
-            this.pollRequested();
-        }
-    }
-
-    private unwatch(jobId: string): void {
-        const deleted = this.watchedJobs.delete(jobId);
-        this.stopWatcherIfEmpty();
-        if (deleted) {
-            this.onActivityChange?.();
-        }
-    }
 
     private async fetchWatchedJobs(): Promise<void> {
-        if (this.watchedJobs.size === 0) {
-            this.stopWatcherIfEmpty();
+        if (this.disposed || this.subscriptions.size === 0) {
+            this.stopIfEmpty();
             return;
         }
+        // Only subscriptions present when this GET began may consume its result.
+        const snapshot = Array.from(this.subscriptions, ([jobId, sessions]) =>
+            [jobId, Array.from(sessions)] as const);
         try {
             const statuses = await this.client.list();
-            const buffer: string[] = [];
-            let stateChanged = false;
-            for (const [watchedJobId, oldStatus] of this.watchedJobs.entries()) {
-                const job = statuses.jobs.find(job => job.submission.id === watchedJobId);
+            if (this.disposed) return;
+            const jobsById = new Map(statuses.jobs.map((job) => [job.submission.id, job]));
+            const sessionBuffers = new Map<string, {
+                line: string | undefined;
+                delta: SessionWatchDelta;
+                subscription: {status: string};
+            }[]>();
+
+            const recordForSession = (sessionKey: string, line: string | undefined, delta: SessionWatchDelta, subscription: {status: string}) => {
+                let entry = sessionBuffers.get(sessionKey);
+                if (!entry) {
+                    entry = [];
+                    sessionBuffers.set(sessionKey, entry);
+                }
+                entry.push({line, delta, subscription});
+            };
+
+            for (const [watchedJobId, subscribers] of snapshot) {
+                const perSession = this.subscriptions.get(watchedJobId);
+                if (!perSession) continue;
+                const currentSubscribers = subscribers.filter(([key, subscription]) => perSession.get(key) === subscription);
+                const job = jobsById.get(watchedJobId);
                 if (!job) {
-                    buffer.push(`${watchedJobId} was not found; we will stop watching this job. The job may have completed or aged out. Re-list/watch if necessary.`);
-                    this.watchedJobs.delete(watchedJobId);
-                    stateChanged = true;
+                    for (const [sessionKey, subscription] of currentSubscribers) {
+                        recordForSession(
+                            sessionKey,
+                            `${watchedJobId} was not found; we will stop watching this job. The job may have completed or aged out. Re-list/watch if necessary.`,
+                            { kind: 'unwatch', jobId: watchedJobId },
+                            subscription,
+                        );
+                    }
                     continue;
                 }
-                // Compare describe(job) rather than raw Job so heartbeats (updated_at) and
-                // submission.prompt / submission.setup_script never bloat agent context.
+
                 const summary = describe(job);
                 const stringified = JSON.stringify(summary);
                 const isFinished = job.phase.kind === 'finished';
-                if (stringified !== oldStatus) {
-                    if (isFinished) {
-                        this.watchedJobs.delete(watchedJobId);
-                        buffer.push(`${watchedJobId} has finished: ${stringified}`);
-                    } else {
-                        this.watchedJobs.set(watchedJobId, stringified);
-                        buffer.push(`${watchedJobId} has changed status: ${stringified}`);
+
+                for (const [sessionKey, subscription] of currentSubscribers) {
+                    if (stringified !== subscription.status) {
+                        if (isFinished) {
+                            recordForSession(
+                                sessionKey,
+                                `${watchedJobId} has finished: ${stringified}`,
+                                { kind: 'unwatch', jobId: watchedJobId },
+                                subscription,
+                            );
+                        } else {
+                            recordForSession(
+                                sessionKey,
+                                `${watchedJobId} has changed status: ${stringified}`,
+                                { kind: 'watch', jobId: watchedJobId, status: stringified },
+                                subscription,
+                            );
+                        }
+                    } else if (isFinished) {
+                        recordForSession(sessionKey, undefined, { kind: 'unwatch', jobId: watchedJobId }, subscription);
                     }
-                    stateChanged = true;
-                } else if (isFinished) {
-                    this.watchedJobs.delete(watchedJobId);
-                    stateChanged = true;
+                }
+
+            }
+
+            for (const [sessionKey, buffered] of sessionBuffers) {
+                if (this.disposed) return;
+                const updates = buffered.filter(({delta, subscription}) =>
+                    this.subscriptions.get(delta.jobId)?.get(sessionKey) === subscription);
+                if (updates.length === 0) continue;
+                const lines = updates.flatMap(({line}) => line ? [line] : []);
+                const deltas = updates.map(({delta}) => delta);
+                const remaining = Array.from(this.subscriptions).some(([jobId, sessions]) =>
+                    sessions.has(sessionKey) && !deltas.some((delta) => delta.jobId === jobId && delta.kind === 'unwatch'));
+                if (lines.length > 0 && !remaining) {
+                    lines.push('All watched jobs have concluded; job watching has stopped.');
+                }
+                const notificationText = lines.length > 0
+                    ? `Updates about watched jobs:\n${lines.join('\n')}`
+                    : '';
+                try {
+                    // Cursor changes take effect only after durable handoff; failures retry on the next poll.
+                    await this.onSessionUpdate(sessionKey, notificationText, deltas);
+                } catch (error) {
+                    console.error(`Failed to persist watched-job update for ${sessionKey}:`, error);
+                    continue;
+                }
+                if (this.disposed) return;
+                for (const {delta, subscription} of updates) {
+                    const sessions = this.subscriptions.get(delta.jobId);
+                    if (sessions?.get(sessionKey) !== subscription) continue;
+                    if (delta.kind === 'unwatch') {
+                        sessions.delete(sessionKey);
+                        if (sessions.size === 0) this.subscriptions.delete(delta.jobId);
+                    } else subscription.status = delta.status;
                 }
             }
-            if (this.watchedJobs.size === 0 && this.watcherInterval) {
-                this.stopWatcherIfEmpty();
-                if (buffer.length) {
-                    buffer.push('All watched jobs have concluded; job watching has stopped.');
-                }
-            }
-            if (stateChanged) {
-                this.onActivityChange?.();
-            }
-            if (buffer.length) {
-                console.log('notifying about watched job status changes');
-                this.notify(`Updates about watched jobs:\n${buffer.join('\n')}`);
-            } else {
-                console.log(`no updates about ${this.watchedJobs.size} watched jobs`);
-            }
+            this.stopIfEmpty();
         } catch (error) {
             console.error(`fetchWatchedJobs: ${error}: ${(error as Error)?.stack}`);
         }
+    }
+}
+
+export class ControlTower {
+    private readonly client: ReturnType<typeof createClient>;
+    private readonly configurationOptions: {jobConfigurations: JobConfigurations};
+    private readonly onWatchJob: ((jobId: string, initialStatus?: string) => void) | undefined;
+    private readonly onUnwatchJob: ((jobId: string) => void) | undefined;
+
+    constructor(options: ControlTowerOptions) {
+        this.client = createClient(options);
+        this.onWatchJob = options.onWatchJob;
+        this.onUnwatchJob = options.onUnwatchJob;
+        this.configurationOptions = {
+            jobConfigurations: options.jobConfigurations,
+        };
+    }
+
+    private watch(jobId: string, initialStatus?: string): void {
+        this.onWatchJob?.(jobId, initialStatus);
+    }
+
+    private unwatch(jobId: string): void {
+        this.onUnwatchJob?.(jobId);
     }
 
     public createTools() {
@@ -368,7 +474,7 @@ function render(value: unknown): string {
     return JSON.stringify(value, null, 2);
 }
 
-function createClient(options: ControlTowerOptions) {
+function createClient(options: { baseUrl?: string; timeoutMs?: number; fetch?: typeof fetch }) {
     const base = new URL(options.baseUrl ?? 'http://127.0.0.1:8090');
     // Control Tower answers only loopback Host headers, and only a loopback base keeps
     // the unauthenticated operator API off the network.

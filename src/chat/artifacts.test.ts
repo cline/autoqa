@@ -27,6 +27,7 @@ test('Curator clears failed fetches so retries succeed and extracts .tar.zst bun
         let attempts = 0;
         const notifications: string[] = [];
         const uploaded: string[] = [];
+        const fetchedCallbacks: [string, string][] = [];
 
         const curator = new Curator(
             storage,
@@ -37,6 +38,7 @@ test('Curator clears failed fetches so retries succeed and extracts .tar.zst bun
             },
             {
                 baseUrl: 'http://127.0.0.1:18091',
+                onArtifactFetched: (id, rel) => { fetchedCallbacks.push([id, rel]); },
                 fetch: async () => {
                     attempts++;
                     if (attempts === 1) {
@@ -65,7 +67,7 @@ test('Curator clears failed fetches so retries succeed and extracts .tar.zst bun
         await new Promise((r) => setTimeout(r, 150));
         assert.equal(notifications.length, 2);
         assert.match(notifications[1]!, /completed; artifacts are available at job-retry/);
-        assert.deepEqual(curator.getFetchedArtifacts(), [['job-retry', 'job-retry']]);
+        assert.deepEqual(fetchedCallbacks, [['job-retry', 'job-retry']]);
 
         const listOut = await listTool.execute({ jobId: 'job-retry' }, dummyContext);
         assert.match(listOut, /report\.md/);

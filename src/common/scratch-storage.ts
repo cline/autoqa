@@ -40,10 +40,6 @@ export class ScratchStorage implements AsyncDisposable {
         throw new Error(`${s} traverses outside scratch storage`);
     }
 
-    public async newDirectory(prefix: string): Promise<string> {
-        return fs.mkdtemp(await this.checked(prefix));
-    }
-
     public async [Symbol.asyncDispose](): Promise<void> {
         const pending = this._root;
         if (pending) {
